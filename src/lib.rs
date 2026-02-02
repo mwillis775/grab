@@ -385,6 +385,20 @@ impl Grab {
     pub fn bundle_store(&self) -> &Arc<BundleStore> {
         &self.bundle_store
     }
+
+    /// Dial a peer address
+    pub async fn dial_peer(&self, addr: &str) -> Result<()> {
+        if let Some(network) = self.network.read().as_ref() {
+            network.dial(addr).await
+        } else {
+            Err(anyhow::anyhow!("Network not running"))
+        }
+    }
+
+    /// Subscribe to network events
+    pub fn subscribe_network(&self) -> Option<tokio::sync::broadcast::Receiver<network::NetworkEvent>> {
+        self.network.read().as_ref().map(|n| n.subscribe())
+    }
 }
 
 /// Network status information

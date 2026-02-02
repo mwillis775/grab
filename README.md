@@ -15,6 +15,7 @@ GrabNet is a peer-to-peer protocol for publishing and hosting websites on a dece
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
+- [P2P Networking](#p2p-networking)
 - [Architecture](#architecture)
 - [Protocol Specification](#protocol-specification)
 - [User Uploads](#user-uploads)
@@ -288,11 +289,17 @@ grab gateway --port 3000
 # Start P2P node (full node - hosts content)
 grab node start
 
+# Connect to bootstrap peers on start
+grab node start --bootstrap /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
+
 # Light mode (no hosting, just publishing)
 grab node start --light
 
 # Custom port
 grab node start --port 4002
+
+# Connect to a specific peer
+grab node connect /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
 
 # Check node status
 grab node status
@@ -301,10 +308,25 @@ grab node status
 grab node stop
 ```
 
+### Pinning Remote Sites
+
+```bash
+# Pin a site from the network
+grab pin <site-id>
+
+# Pin with a specific peer address
+grab pin <site-id> --peer /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
+
+# Example:
+grab pin AtnArdZARzYJ7sTKYdrn4HHYsofuSe9gonDNsrqwFFa1 --peer /ip4/192.168.1.100/tcp/4001
+```
+
+This fetches the site from the network and hosts it locally. Your node will then serve the site to other peers and through the HTTP gateway.
+
 ### Hosting Commands
 
 ```bash
-# Host (pin) someone else's site
+# Host (pin) a local site
 grab host <site-id>
 
 # Stop hosting a site
@@ -352,6 +374,49 @@ grab stats
 -h, --help          # Show help
 -V, --version       # Show version
 ```
+
+---
+
+## P2P Networking
+
+GrabNet uses [libp2p](https://libp2p.io/) for peer-to-peer networking with the following protocols:
+
+### Protocols Used
+
+| Protocol | Purpose |
+|----------|---------|
+| **Kademlia DHT** | Peer discovery and content routing |
+| **Gossipsub** | Real-time site announcements and updates |
+| **mDNS** | Local network peer discovery |
+| **Identify** | Peer identification and address exchange |
+| **Noise** | Encrypted connections |
+
+### Network Events
+
+When running a node, you'll see events like:
+
+```
+🌐 Starting GrabNet node...
+✓ Node started
+  Peer ID: 12D3KooWMrzk1N4k9sqP4vxmii8rbqNymzJKDRYxtH5ZTuuqG21w
+
+  🟢 Peer connected: 12D3KooWHK5mD...
+  📢 Site announced: AtnArdZA... rev 3 from 12D3KooWHK5mD...
+  ✓ Bootstrap complete, 5 peers
+```
+
+### Hosting Content
+
+When you run a node, you:
+1. **Announce** your published sites to the DHT
+2. **Respond** to requests from other peers
+3. **Replicate** content to help the network
+
+Other nodes can find your sites by querying the DHT and request content directly.
+
+### Firewall Configuration
+
+For best connectivity, open port 4001 (TCP) on your firewall. GrabNet also works behind NAT using the libp2p hole-punching and relay protocols.
 
 ---
 

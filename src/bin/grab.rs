@@ -79,6 +79,16 @@ enum Commands {
         site_id: String,
     },
 
+    /// Pin a remote site from the network
+    Pin {
+        /// Site ID to pin
+        site_id: String,
+        
+        /// Peer address to connect to
+        #[arg(short, long)]
+        peer: Option<String>,
+    },
+
     /// Stop hosting a site
     Unhost {
         /// Site ID to unhost
@@ -117,10 +127,20 @@ enum NodeAction {
         /// Run in light mode (no hosting)
         #[arg(long)]
         light: bool,
+        
+        /// Bootstrap peers to connect to
+        #[arg(short, long)]
+        bootstrap: Vec<String>,
     },
 
     /// Show node status
     Status,
+
+    /// Connect to a peer
+    Connect {
+        /// Peer multiaddress
+        address: String,
+    },
 
     /// Stop the node
     Stop,
@@ -276,21 +296,61 @@ async fn main() -> Result<()> {
 
         Commands::Node { action } => {
             match action {
-                NodeAction::Start { port: _, light: _ } => {
+                NodeAction::Start { port: _, light: _, bootstrap } => {
                     println!("🌐 Starting GrabNet node...");
                     grab.start_network().await?;
                     
                     let status = grab.network_status();
                     println!();
                     println!("✓ Node started");
-                    if let Some(peer_id) = status.peer_id {
+                    if let Some(peer_id) = &status.peer_id {
                         println!("  Peer ID: {}", peer_id);
                     }
+                    
+                    // Connect to additional bootstrap peers
+                    if !bootstrap.is_empty() {
+                        for addr in bootstrap {
+                            println!("  Connecting to {}...", addr);
+                            if let Err(e) = grab.dial_peer(&addr).await {
+                                println!("  ⚠️  Failed: {}", e);
+                            }
+                        }
+                    }
 
-                    // Keep running
+                    // Keep running and show events
                     println!();
                     println!("Press Ctrl+C to stop");
-                    tokio::signal::ctrl_c().await?;
+                    println!();
+                    
+                    // Subscribe to events
+                    if let Some(mut rx) = grab.subscribe_network() {
+                        loop {
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {
+                                    break;
+                                }
+                                event = rx.recv() => {
+                                    match event {
+                                        Ok(grabnet::network::NetworkEvent::PeerConnected(peer)) => {
+                                            println!("  🟢 Peer connected: {}", peer);
+                                        }
+                                        Ok(grabnet::network::NetworkEvent::PeerDisconnected(peer)) => {
+                                            println!("  🔴 Peer disconnected: {}", peer);
+                                        }
+                                        Ok(grabnet::network::NetworkEvent::SiteAnnounced { site_id, peer_id, revision }) => {
+                                            println!("  📢 Site announced: {} rev {} from {}", site_id.to_base58(), revision, peer_id);
+                                        }
+                                        Ok(grabnet::network::NetworkEvent::BootstrapComplete { peers }) => {
+                                            println!("  ✓ Bootstrap complete, {} peers", peers);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::signal::ctrl_c().await?;
+                    }
                 }
 
                 NodeAction::Status => {
@@ -304,6 +364,15 @@ async fn main() -> Result<()> {
                     } else {
                         println!("🔴 Node is not running");
                     }
+                }
+
+                NodeAction::Connect { address } => {
+                    // Start network if not running
+                    grab.start_network().await?;
+                    
+                    println!("Connecting to {}...", address);
+                    grab.dial_peer(&address).await?;
+                    println!("✓ Connection initiated");
                 }
 
                 NodeAction::Stop => {
@@ -323,6 +392,42 @@ async fn main() -> Result<()> {
                 println!("✓ Now hosting site");
             } else {
                 println!("❌ Failed to host site (not found)");
+            }
+        }
+
+        Commands::Pin { site_id, peer } => {
+            println!("📥 Pinning remote site {}...", site_id);
+
+            let id = grabnet::SiteId::from_base58(&site_id)
+                .ok_or_else(|| anyhow::anyhow!("Invalid site ID"))?;
+
+            // Start network
+            println!("  Starting P2P network...");
+            grab.start_network().await?;
+            
+            // Give it a moment to initialize
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // Connect to peer if provided
+            if let Some(peer_addr) = peer {
+                println!("  Connecting to peer {}...", peer_addr);
+                grab.dial_peer(&peer_addr).await?;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+
+            // Try to fetch and host
+            if grab.host(&id).await? {
+                println!("✓ Site pinned successfully!");
+                
+                // Show info
+                if let Ok(Some(bundle)) = grab.bundle_store().get_bundle(&id) {
+                    println!("  Name:     {}", bundle.name);
+                    println!("  Revision: {}", bundle.revision);
+                    println!("  Files:    {}", bundle.manifest.files.len());
+                }
+            } else {
+                println!("❌ Failed to find site on network");
+                println!("  Try providing a peer address: grab pin {} --peer /ip4/x.x.x.x/tcp/4001", site_id);
             }
         }
 
