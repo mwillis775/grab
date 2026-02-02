@@ -96,6 +96,10 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
+
+        /// Default site to serve at root (name or ID)
+        #[arg(long)]
+        default_site: Option<String>,
     },
 
     /// Show storage statistics
@@ -366,10 +370,31 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Gateway { port } => {
+        Commands::Gateway { port, default_site } => {
             println!("🌐 Starting HTTP gateway on port {}...", port);
             
-            grab.start_gateway_on_port(port).await?;
+            // Resolve default site if provided
+            let default_site_id = if let Some(site_ref) = default_site {
+                // Try to find by name first
+                if let Some(published) = grab.bundle_store().get_published_site(&site_ref)? {
+                    println!("  Default site: {} ({})", published.name, published.site_id.to_base58());
+                    Some(published.site_id)
+                } else if let Some(id) = grabnet::SiteId::from_base58(&site_ref) {
+                    println!("  Default site: {}", site_ref);
+                    Some(id)
+                } else {
+                    println!("❌ Site not found: {}", site_ref);
+                    return Ok(());
+                }
+            } else {
+                None
+            };
+
+            if let Some(site_id) = default_site_id {
+                grab.start_gateway_with_default_site(port, site_id).await?;
+            } else {
+                grab.start_gateway_on_port(port).await?;
+            }
 
             let stats = grab.storage_stats();
             println!();

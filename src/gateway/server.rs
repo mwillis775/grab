@@ -28,6 +28,7 @@ pub struct Gateway {
     bundle_store: Arc<BundleStore>,
     content_manager: Option<UserContentManager>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    default_site: Option<SiteId>,
 }
 
 /// Shared state for handlers
@@ -36,6 +37,7 @@ struct AppState {
     chunk_store: Arc<ChunkStore>,
     bundle_store: Arc<BundleStore>,
     content_manager: Option<Arc<UserContentManager>>,
+    default_site: Option<SiteId>,
 }
 
 impl Gateway {
@@ -52,6 +54,25 @@ impl Gateway {
             bundle_store,
             content_manager,
             shutdown_tx: None,
+            default_site: None,
+        }
+    }
+
+    /// Create a new gateway with a default site served at root
+    pub fn with_default_site(
+        config: &Config,
+        chunk_store: Arc<ChunkStore>,
+        bundle_store: Arc<BundleStore>,
+        content_manager: Option<UserContentManager>,
+        default_site: SiteId,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            chunk_store,
+            bundle_store,
+            content_manager,
+            shutdown_tx: None,
+            default_site: Some(default_site),
         }
     }
 
@@ -64,10 +85,11 @@ impl Gateway {
             chunk_store: self.chunk_store.clone(),
             bundle_store: self.bundle_store.clone(),
             content_manager: self.content_manager.as_ref().map(|m| Arc::new(m.clone())),
+            default_site: self.default_site.clone(),
         };
 
-        // Build router
-        let app = Router::new()
+        // Build router with standard routes
+        let mut app = Router::new()
             // Health check
             .route("/health", get(health_handler))
             // API routes
@@ -80,7 +102,17 @@ impl Gateway {
             // Site content
             .route("/site/:site_id", get(redirect_to_index))
             .route("/site/:site_id/", get(serve_site_index))
-            .route("/site/:site_id/*path", get(serve_site_handler))
+            .route("/site/:site_id/*path", get(serve_site_handler));
+
+        // Add root routes if default site is set
+        if self.default_site.is_some() {
+            app = app
+                .route("/", get(serve_default_index))
+                .route("/*path", get(serve_default_handler));
+            tracing::info!("Default site configured at root");
+        }
+
+        let app = app
             // CORS
             .layer(CorsLayer::new()
                 .allow_origin(Any)
@@ -219,12 +251,45 @@ async fn serve_site_handler(
     serve_site_path(site_id, path, headers, state).await
 }
 
+// ============================================================================
+// Default Site Handlers (serve at root when configured)
+// ============================================================================
+
+async fn serve_default_index(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let site_id = match &state.default_site {
+        Some(id) => id.to_base58(),
+        None => return (StatusCode::NOT_FOUND, "No default site configured").into_response(),
+    };
+    serve_site_path(site_id, "".to_string(), headers, state).await
+}
+
+async fn serve_default_handler(
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    // Skip API and site routes
+    if path.starts_with("api/") || path.starts_with("site/") || 
+       path.starts_with("uploads/") || path == "health" {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+    
+    let site_id = match &state.default_site {
+        Some(id) => id.to_base58(),
+        None => return (StatusCode::NOT_FOUND, "No default site configured").into_response(),
+    };
+    serve_site_path(site_id, path, headers, state).await
+}
+
 async fn serve_site_path(
     site_id: String,
     path: String,
     headers: HeaderMap,
     state: AppState,
-) -> impl IntoResponse {
+) -> Response {
     tracing::debug!("serve_site_path: site_id={}, path={}", site_id, path);
     
     let site_id = match SiteId::from_base58(&site_id) {

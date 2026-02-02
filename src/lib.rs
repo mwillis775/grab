@@ -256,6 +256,16 @@ impl Grab {
 
     /// Start the HTTP gateway on a specific port
     pub async fn start_gateway_on_port(&self, port: u16) -> Result<()> {
+        self.start_gateway_with_options(port, None).await
+    }
+
+    /// Start the HTTP gateway with a default site served at root
+    pub async fn start_gateway_with_default_site(&self, port: u16, default_site: SiteId) -> Result<()> {
+        self.start_gateway_with_options(port, Some(default_site)).await
+    }
+
+    /// Start the HTTP gateway with options
+    async fn start_gateway_with_options(&self, port: u16, default_site: Option<SiteId>) -> Result<()> {
         if self.gateway.read().is_some() {
             return Ok(());
         }
@@ -263,12 +273,22 @@ impl Grab {
         let mut config = self.config.clone();
         config.gateway.port = port;
 
-        let gateway = Gateway::new(
-            &config,
-            self.chunk_store.clone(),
-            self.bundle_store.clone(),
-            self.content_manager.read().clone(),
-        );
+        let gateway = if let Some(site_id) = default_site {
+            Gateway::with_default_site(
+                &config,
+                self.chunk_store.clone(),
+                self.bundle_store.clone(),
+                self.content_manager.read().clone(),
+                site_id,
+            )
+        } else {
+            Gateway::new(
+                &config,
+                self.chunk_store.clone(),
+                self.bundle_store.clone(),
+                self.content_manager.read().clone(),
+            )
+        };
 
         gateway.start().await?;
         *self.gateway.write() = Some(gateway);
