@@ -10,6 +10,7 @@ GrabNet is a peer-to-peer protocol for publishing and hosting websites on a dece
 ## Table of Contents
 
 - [Why GrabNet?](#why-grabnet)
+- [Live Sites](#live-sites)
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -51,6 +52,18 @@ GrabNet is a peer-to-peer protocol for publishing and hosting websites on a dece
 | User-generated content | ✅ Yes | ❌ Complex | ✅ Built-in |
 | Cost | ❌ Ongoing | ✅ Free (if pinned) | ✅ Free |
 | Setup complexity | ❌ Complex | ❌ Complex | ✅ Single binary |
+
+---
+
+## Live Sites
+
+Sites currently hosted on GrabNet:
+
+| Site | Description |
+|------|-------------|
+| [rootedrevival.us](https://rootedrevival.us) | Regenerative landscaping business + Open Scholar knowledge repository |
+
+*Running your own GrabNet site? Open a PR to add it here!*
 
 ---
 
