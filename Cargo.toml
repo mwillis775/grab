@@ -1,0 +1,87 @@
+[package]
+name = "grabnet"
+version = "0.1.0"
+edition = "2021"
+authors = ["GrabNet Contributors"]
+description = "Decentralized web hosting protocol - purpose-built for websites"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/grabnet/grabnet"
+keywords = ["decentralized", "web3", "hosting", "p2p", "websites"]
+categories = ["web-programming", "network-programming"]
+
+[lib]
+name = "grabnet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "grab"
+path = "src/bin/grab.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+
+# Cryptography
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+rand = "0.8"
+
+# P2P Networking
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "identify",
+    "kad",
+    "gossipsub",
+    "request-response",
+    "mdns",
+    "macros",
+    "serde",
+] }
+
+# HTTP Gateway
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "compression-gzip", "fs"] }
+hyper = { version = "1.1", features = ["full"] }
+
+# Storage
+sled = "0.34"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_bytes = "0.11"
+bincode = "1.3"
+bs58 = "0.5"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# Utilities
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+bytes = "1.5"
+mime_guess = "2.0"
+walkdir = "2.4"
+flate2 = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+dirs = "5.0"
+once_cell = "1.19"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3.9"
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
