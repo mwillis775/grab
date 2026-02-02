@@ -1,9 +1,11 @@
 //! GrabNet CLI
 
 use std::path::PathBuf;
+use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use grabnet::{Grab, PublishOptions, SiteIdExt};
+use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
@@ -50,6 +52,18 @@ enum Commands {
         /// Disable compression
         #[arg(long)]
         no_compress: bool,
+
+        /// Watch for changes and auto-republish
+        #[arg(short, long)]
+        watch: bool,
+
+        /// Command to run before publishing (pre-deploy hook)
+        #[arg(long)]
+        pre_hook: Option<String>,
+
+        /// Command to run after publishing (post-deploy hook)
+        #[arg(long)]
+        post_hook: Option<String>,
     },
 
     /// Update an existing site
@@ -196,17 +210,30 @@ async fn main() -> Result<()> {
             spa,
             clean_urls,
             no_compress,
+            watch,
+            pre_hook,
+            post_hook,
         } => {
+            // Run pre-deploy hook if specified
+            if let Some(ref hook) = pre_hook {
+                println!("🔧 Running pre-deploy hook...");
+                run_hook(hook, &path)?;
+            }
+
             println!("📦 Publishing {}...", path);
 
-            let result = grab.publish(&path, PublishOptions {
-                name,
-                entry,
+            let options = PublishOptions {
+                name: name.clone(),
+                entry: entry.clone(),
                 compress: !no_compress,
-                spa_fallback: spa,
+                spa_fallback: spa.clone(),
                 clean_urls,
+                pre_hook: pre_hook.clone(),
+                post_hook: post_hook.clone(),
                 ..Default::default()
-            }).await?;
+            };
+
+            let result = grab.publish(&path, options.clone()).await?;
 
             println!();
             println!("✓ Bundled {} files ({} bytes)", result.file_count, result.total_size);
@@ -219,8 +246,24 @@ async fn main() -> Result<()> {
             println!("🌐 Site ID:  grab://{}", result.bundle.site_id.to_base58());
             println!("📝 Name:     {}", result.bundle.name);
             println!("🔄 Revision: {}", result.bundle.revision);
+            
+            // Run post-deploy hook if specified
+            if let Some(ref hook) = post_hook {
+                println!();
+                println!("🔧 Running post-deploy hook...");
+                run_hook(hook, &path)?;
+            }
+            
             println!();
-            println!("Start gateway to serve: grab gateway");
+            
+            if watch {
+                println!("👀 Watching for changes... (Ctrl+C to stop)");
+                println!();
+                
+                run_watch_mode(&grab, &path, options).await?;
+            } else {
+                println!("Start gateway to serve: grab gateway");
+            }
         }
 
         Commands::Update { site } => {
@@ -527,4 +570,113 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run watch mode - monitor directory for changes and auto-republish
+async fn run_watch_mode(grab: &Grab, path: &str, options: PublishOptions) -> Result<()> {
+    use std::sync::mpsc::channel;
+    
+    let (tx, rx) = channel();
+    
+    // Create debounced watcher (500ms debounce)
+    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
+    
+    // Watch the directory recursively
+    debouncer.watcher().watch(
+        std::path::Path::new(path),
+        RecursiveMode::Recursive,
+    )?;
+    
+    // Get the site name for updates
+    let site_name = options.name.clone().unwrap_or_else(|| {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "site".to_string())
+    });
+    
+    loop {
+        match rx.recv() {
+            Ok(Ok(events)) => {
+                // Filter out hidden files and build artifacts
+                let relevant_events: Vec<_> = events.iter()
+                    .filter(|e| {
+                        let path_str = e.path.to_string_lossy();
+                        !path_str.contains("/.") &&
+                        !path_str.contains("/node_modules/") &&
+                        !path_str.contains("/target/") &&
+                        !path_str.contains("/.git/")
+                    })
+                    .collect();
+                
+                if relevant_events.is_empty() {
+                    continue;
+                }
+                
+                // Show which files changed
+                for event in &relevant_events {
+                    println!("  📝 Changed: {}", event.path.display());
+                }
+                
+                // Republish
+                println!("🔄 Republishing...");
+                match grab.update(&site_name).await {
+                    Ok(Some(result)) => {
+                        println!("✓ Updated to revision {} ({} files)", 
+                            result.bundle.revision, result.file_count);
+                    }
+                    Ok(None) => {
+                        // Site not found, do full publish
+                        match grab.publish(path, options.clone()).await {
+                            Ok(result) => {
+                                println!("✓ Published revision {} ({} files)", 
+                                    result.bundle.revision, result.file_count);
+                            }
+                            Err(e) => {
+                                println!("❌ Publish failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ Update failed: {}", e);
+                    }
+                }
+                println!();
+            }
+            Ok(Err(error)) => {
+                println!("⚠️  Watch error: {:?}", error);
+            }
+            Err(e) => {
+                println!("❌ Channel error: {}", e);
+                break;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Run a deploy hook command
+fn run_hook(command: &str, working_dir: &str) -> Result<()> {
+    use std::process::Command;
+    
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .output()?;
+    
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    
+    if output.status.success() {
+        println!("✓ Hook completed successfully");
+        Ok(())
+    } else {
+        anyhow::bail!("Hook failed with exit code: {:?}", output.status.code())
+    }
 }

@@ -86,6 +86,18 @@ Sites currently hosted on GrabNet:
 
 - **🗜️ Automatic Compression** - Gzip compression reduces bandwidth by 60-80% for text-based content.
 
+### P2P Features
+
+- **🔄 Persistent Identity** - Your peer ID is stable across restarts, making you discoverable on the network.
+
+- **📌 Site Pinning** - Pin remote sites to host them locally and contribute to their availability.
+
+- **🔁 Auto-Replication** - Sites you host automatically sync when publishers push updates.
+
+- **👀 Watch Mode** - Develop with `--watch` flag for automatic republishing on file changes.
+
+- **🔧 Deploy Hooks** - Run custom commands before and after publishing (build scripts, notifications, etc.).
+
 ### Technical Highlights
 
 - **BLAKE3** for blazing-fast content hashing
@@ -216,11 +228,20 @@ Options:
   --spa <fallback>    Enable SPA mode with fallback file
   --clean-urls        Enable clean URLs (/about → /about.html)
   --no-compress       Disable gzip compression
+  --watch             Watch for changes and auto-republish
+  --pre-hook <cmd>    Command to run before publishing
+  --post-hook <cmd>   Command to run after publishing
 
 # Examples:
 grab publish ./my-blog --name personal-blog
 grab publish ./react-app --spa index.html
 grab publish ./docs --clean-urls
+
+# Watch mode - auto-republish on file changes
+grab publish ./my-site --name dev-site --watch
+
+# With build hooks
+grab publish ./gatsby-site --pre-hook "npm run build" --post-hook "curl -X POST https://hooks.example.com/deployed"
 ```
 
 ```bash
@@ -413,6 +434,24 @@ When you run a node, you:
 3. **Replicate** content to help the network
 
 Other nodes can find your sites by querying the DHT and request content directly.
+
+### Auto-Replication
+
+GrabNet automatically replicates content you're hosting:
+
+1. **Site Announcements**: When a publisher announces a new revision via Gossipsub
+2. **Revision Check**: If you're hosting that site and your revision is older
+3. **Fetch Update**: Automatically request the new manifest and chunks
+4. **Store Locally**: Save the updated content to serve to others
+
+This ensures hosted sites stay up-to-date without manual intervention.
+
+### Persistent Identity
+
+Your peer ID is derived from an Ed25519 keypair stored in `~/.grab/keys.db`. This means:
+- Your peer ID stays the same across restarts
+- Other peers can reliably find you on the network
+- Sites you announce remain discoverable
 
 ### Firewall Configuration
 

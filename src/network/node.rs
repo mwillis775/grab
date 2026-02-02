@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, broadcast};
 
 use super::behaviour::{GrabBehaviour, GrabBehaviourEvent};
 use crate::types::{Config, SiteId, WebBundle, GrabRequest, GrabResponse, PeerRecord, ChunkId};
-use crate::storage::{ChunkStore, BundleStore};
+use crate::storage::{ChunkStore, BundleStore, KeyStore};
 use crate::crypto::SiteIdExt;
 
 /// Default bootstrap peers for the GrabNet network
@@ -83,9 +83,20 @@ impl GrabNetwork {
         config: &Config,
         chunk_store: Arc<ChunkStore>,
         bundle_store: Arc<BundleStore>,
+        key_store: Arc<KeyStore>,
     ) -> Result<Self> {
-        // Generate identity
-        let local_key = identity::Keypair::generate_ed25519();
+        // Get or create persistent identity
+        let (public_key, private_key) = key_store.get_or_create("node")?;
+        
+        // Convert to libp2p identity format
+        // Ed25519 secret key is 32 bytes, but libp2p expects 64-byte format (seed + public)
+        let mut keypair_bytes = [0u8; 64];
+        keypair_bytes[..32].copy_from_slice(&private_key);
+        keypair_bytes[32..].copy_from_slice(&public_key);
+        
+        let ed25519_keypair = identity::ed25519::Keypair::try_from_bytes(&mut keypair_bytes)
+            .map_err(|e| anyhow!("Failed to load identity: {}", e))?;
+        let local_key = identity::Keypair::from(ed25519_keypair);
         let local_peer_id = PeerId::from(local_key.public());
         
         tracing::info!("Local peer ID: {}", local_peer_id);
@@ -214,7 +225,7 @@ impl GrabNetwork {
         }
     }
 
-    /// Fetch a site from the network
+    /// Fetch a site from the network (manifest + all chunks)
     pub async fn fetch_site(&self, site_id: &SiteId) -> Result<Option<WebBundle>> {
         let hosts = self.find_site(site_id).await?;
         
@@ -224,6 +235,7 @@ impl GrabNetwork {
 
         for host in hosts {
             if let Ok(peer_id) = host.peer_id.parse::<PeerId>() {
+                // First, get the manifest
                 let (tx, rx) = oneshot::channel();
                 self.command_tx.send(SwarmCommand::SendRequest(
                     peer_id,
@@ -232,6 +244,50 @@ impl GrabNetwork {
                 )).await?;
 
                 if let Ok(Ok(GrabResponse::Manifest { bundle })) = rx.await {
+                    // Collect all chunk IDs from the manifest
+                    let mut all_chunks: Vec<ChunkId> = Vec::new();
+                    for file in &bundle.manifest.files {
+                        for chunk_id in &file.chunks {
+                            if !all_chunks.contains(chunk_id) {
+                                all_chunks.push(*chunk_id);
+                            }
+                        }
+                    }
+
+                    tracing::info!("Fetching {} chunks from peer {}", all_chunks.len(), peer_id);
+
+                    // Fetch chunks in batches (avoid too large requests)
+                    const BATCH_SIZE: usize = 50;
+                    for batch in all_chunks.chunks(BATCH_SIZE) {
+                        match self.get_chunks(&peer_id, batch).await {
+                            Ok(chunks) => {
+                                for (expected_id, data) in chunks {
+                                    // Store chunk and verify hash matches
+                                    match self.chunk_store.put(&data) {
+                                        Ok(actual_id) => {
+                                            if actual_id != expected_id {
+                                                tracing::warn!(
+                                                    "Chunk hash mismatch! Expected {} got {}",
+                                                    hex::encode(&expected_id[..8]),
+                                                    hex::encode(&actual_id[..8])
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Failed to store chunk: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch chunk batch: {}", e);
+                            }
+                        }
+                    }
+
+                    tracing::info!("Successfully fetched site {} with {} files", 
+                        site_id.to_base58(), bundle.manifest.files.len());
+
                     return Ok(Some(*bundle));
                 }
             }
@@ -315,6 +371,12 @@ async fn run_swarm(
 
     // Pending requests
     let mut pending_requests: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<GrabResponse>>> = HashMap::new();
+    
+    // Pending replication requests (site_id -> requesting from peer)
+    let mut pending_replications: HashMap<request_response::OutboundRequestId, (SiteId, PeerId)> = HashMap::new();
+    
+    // Pending bundle replications - waiting for chunks (request_id -> bundle to save after chunks arrive)
+    let mut pending_bundle_replications: HashMap<request_response::OutboundRequestId, WebBundle> = HashMap::new();
     
     // Pending DHT queries
     let mut pending_site_queries: HashMap<QueryId, (SiteId, oneshot::Sender<Vec<PeerRecord>>)> = HashMap::new();
@@ -423,6 +485,75 @@ async fn run_swarm(
                             request_response::Message::Response { request_id, response } => {
                                 if let Some(tx) = pending_requests.remove(&request_id) {
                                     let _ = tx.send(Ok(response));
+                                } else if let Some((site_id, peer_id)) = pending_replications.remove(&request_id) {
+                                    // Handle auto-replication manifest response
+                                    if let GrabResponse::Manifest { bundle } = response {
+                                        tracing::info!(
+                                            "Received manifest for replication: {} rev {}",
+                                            site_id.to_base58(), bundle.revision
+                                        );
+                                        
+                                        // Collect all chunk IDs
+                                        let mut all_chunks: Vec<ChunkId> = Vec::new();
+                                        for file in &bundle.manifest.files {
+                                            for chunk_id in &file.chunks {
+                                                if !all_chunks.contains(chunk_id) {
+                                                    all_chunks.push(*chunk_id);
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Request chunks in a single batch (or could be multiple)
+                                        if !all_chunks.is_empty() {
+                                            let chunk_request_id = swarm.behaviour_mut().request_response.send_request(
+                                                &peer_id,
+                                                GrabRequest::GetChunks { chunk_ids: all_chunks },
+                                            );
+                                            // Store bundle for when chunks arrive
+                                            pending_bundle_replications.insert(chunk_request_id, *bundle);
+                                        } else {
+                                            // No chunks needed, just save the bundle
+                                            if let Err(e) = bundle_store.save_hosted_site(&bundle) {
+                                                tracing::warn!("Failed to save replicated bundle: {}", e);
+                                            } else {
+                                                tracing::info!("Replicated site {} with 0 chunks", site_id.to_base58());
+                                            }
+                                        }
+                                    }
+                                } else if let Some(bundle) = pending_bundle_replications.remove(&request_id) {
+                                    // Handle auto-replication chunks response
+                                    if let GrabResponse::Chunks { chunks } = response {
+                                        tracing::info!(
+                                            "Received {} chunks for replication of {}",
+                                            chunks.len(), bundle.site_id.to_base58()
+                                        );
+                                        
+                                        // Store all chunks
+                                        for (expected_id, data) in chunks {
+                                            match chunk_store.put(&data) {
+                                                Ok(actual_id) => {
+                                                    if actual_id != expected_id {
+                                                        tracing::warn!(
+                                                            "Chunk hash mismatch during replication"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("Failed to store replicated chunk: {}", e);
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Save the bundle
+                                        if let Err(e) = bundle_store.save_hosted_site(&bundle) {
+                                            tracing::warn!("Failed to save replicated bundle: {}", e);
+                                        } else {
+                                            tracing::info!(
+                                                "Successfully replicated site {} rev {}",
+                                                bundle.site_id.to_base58(), bundle.revision
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -474,6 +605,28 @@ async fn run_swarm(
                             let result: Result<(SiteId, u64), _> = bincode::deserialize(&message.data);
                             if let Ok((site_id, revision)) = result {
                                 tracing::debug!("Received site announcement: {} rev {}", site_id.to_base58(), revision);
+                                
+                                // Check if we're hosting this site and need to update
+                                let should_replicate = if let Ok(Some(hosted)) = bundle_store.get_bundle(&site_id) {
+                                    hosted.revision < revision
+                                } else {
+                                    false
+                                };
+                                
+                                if should_replicate {
+                                    tracing::info!(
+                                        "Auto-replicating site {} from peer {} (new revision {})",
+                                        site_id.to_base58(), propagation_source, revision
+                                    );
+                                    
+                                    // Request manifest from the announcing peer
+                                    let request_id = swarm.behaviour_mut().request_response.send_request(
+                                        &propagation_source,
+                                        GrabRequest::GetManifest { site_id },
+                                    );
+                                    pending_replications.insert(request_id, (site_id, propagation_source));
+                                }
+                                
                                 let _ = event_tx.send(NetworkEvent::SiteAnnounced {
                                     site_id,
                                     peer_id: propagation_source,

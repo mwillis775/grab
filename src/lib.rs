@@ -205,6 +205,7 @@ impl Grab {
             &self.config,
             self.chunk_store.clone(),
             self.bundle_store.clone(),
+            self.key_store.clone(),
         ).await?;
 
         network.start().await?;

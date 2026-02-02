@@ -33,6 +33,10 @@ pub struct PublishOptions {
     pub spa_fallback: Option<String>,
     /// Enable clean URLs
     pub clean_urls: bool,
+    /// Command to run before publishing (pre-deploy hook)
+    pub pre_hook: Option<String>,
+    /// Command to run after publishing (post-deploy hook)
+    pub post_hook: Option<String>,
 }
 
 /// Result of publishing a website
