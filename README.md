@@ -62,7 +62,7 @@ Sites currently hosted on GrabNet:
 
 | Site | Description |
 |------|-------------|
-| [rootedrevival.us](https://rootedrevival.us) | Regenerative landscaping business + Open Scholar knowledge repository |
+| [rootedrevival.us](https://rootedrevival.us/) | Regenerative landscaping business + Open Scholar knowledge repository |
 
 *Running your own GrabNet site? Open a PR to add it here!*
 
