@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 use std::net::SocketAddr;
+use std::time::Instant;
 use anyhow::Result;
 use axum::{
     Router,
     routing::get,
     extract::{Path, State, Query},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, Html},
     http::{StatusCode, header, HeaderMap, HeaderValue},
     body::Body,
     Json,
@@ -15,11 +16,13 @@ use axum::{
 use tower_http::cors::{CorsLayer, Any};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use parking_lot::RwLock;
 
 use crate::types::{Config, SiteId, FileEntry, Compression};
 use crate::storage::{ChunkStore, BundleStore};
 use crate::content::UserContentManager;
 use crate::crypto::SiteIdExt;
+use crate::network::GrabNetwork;
 
 /// HTTP Gateway for serving GrabNet sites
 pub struct Gateway {
@@ -29,6 +32,8 @@ pub struct Gateway {
     content_manager: Option<UserContentManager>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     default_site: Option<SiteId>,
+    network: Option<Arc<RwLock<Option<GrabNetwork>>>>,
+    start_time: Instant,
 }
 
 /// Shared state for handlers
@@ -38,6 +43,8 @@ struct AppState {
     bundle_store: Arc<BundleStore>,
     content_manager: Option<Arc<UserContentManager>>,
     default_site: Option<SiteId>,
+    network: Option<Arc<RwLock<Option<GrabNetwork>>>>,
+    start_time: Instant,
 }
 
 impl Gateway {
@@ -55,6 +62,8 @@ impl Gateway {
             content_manager,
             shutdown_tx: None,
             default_site: None,
+            network: None,
+            start_time: Instant::now(),
         }
     }
 
@@ -73,7 +82,15 @@ impl Gateway {
             content_manager,
             shutdown_tx: None,
             default_site: Some(default_site),
+            network: None,
+            start_time: Instant::now(),
         }
+    }
+
+    /// Set the network reference for peer info endpoints
+    pub fn with_network(mut self, network: Arc<RwLock<Option<GrabNetwork>>>) -> Self {
+        self.network = Some(network);
+        self
     }
 
     /// Start the gateway
@@ -86,12 +103,19 @@ impl Gateway {
             bundle_store: self.bundle_store.clone(),
             content_manager: self.content_manager.as_ref().map(|m| Arc::new(m.clone())),
             default_site: self.default_site.clone(),
+            network: self.network.clone(),
+            start_time: self.start_time,
         };
 
         // Build router with standard routes
         let mut app = Router::new()
             // Health check
             .route("/health", get(health_handler))
+            // Network/Peer viewer routes
+            .route("/api/network", get(network_status_handler))
+            .route("/api/network/peers", get(peers_handler))
+            .route("/api/network/stats", get(network_stats_handler))
+            .route("/peers", get(peer_viewer_handler))
             // API routes
             .route("/api/sites", get(list_sites_handler))
             .route("/api/sites/:site_id", get(get_site_handler))
@@ -516,4 +540,417 @@ async fn serve_upload_handler(
         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
         .body(Body::from(content))
         .unwrap()
+}
+
+// ============================================================================
+// Network & Peer Viewer Handlers
+// ============================================================================
+
+/// Network status response
+#[derive(Serialize)]
+struct NetworkStatusResponse {
+    running: bool,
+    peer_id: Option<String>,
+    connected_peers: usize,
+    listen_addresses: Vec<String>,
+    uptime_seconds: u64,
+    published_sites: usize,
+    hosted_sites: usize,
+}
+
+/// Peer info response
+#[derive(Serialize)]
+struct PeerInfo {
+    peer_id: String,
+    connected: bool,
+    addresses: Vec<String>,
+}
+
+/// Network stats response
+#[derive(Serialize)]
+struct NetworkStatsResponse {
+    total_chunks: usize,
+    total_storage_bytes: u64,
+    published_sites: usize,
+    hosted_sites: usize,
+    connected_peers: usize,
+    uptime_seconds: u64,
+}
+
+async fn network_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let uptime = state.start_time.elapsed().as_secs();
+    
+    let (running, peer_id, peers, addresses) = if let Some(net_lock) = &state.network {
+        let guard = net_lock.read();
+        if let Some(network) = guard.as_ref() {
+            (
+                true,
+                Some(network.peer_id().to_string()),
+                network.connected_peers(),
+                network.listen_addresses(),
+            )
+        } else {
+            (false, None, 0, vec![])
+        }
+    } else {
+        (false, None, 0, vec![])
+    };
+
+    let published = state.bundle_store.get_all_published_sites().unwrap_or_default().len();
+    let hosted = state.bundle_store.get_all_hosted_sites().unwrap_or_default().len();
+
+    Json(NetworkStatusResponse {
+        running,
+        peer_id,
+        connected_peers: peers,
+        listen_addresses: addresses,
+        uptime_seconds: uptime,
+        published_sites: published,
+        hosted_sites: hosted,
+    })
+}
+
+async fn peers_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let peers: Vec<PeerInfo> = if let Some(net_lock) = &state.network {
+        let guard = net_lock.read();
+        if let Some(network) = guard.as_ref() {
+            network.connected_peer_ids()
+                .into_iter()
+                .map(|pid| PeerInfo {
+                    peer_id: pid.to_string(),
+                    connected: true,
+                    addresses: vec![],
+                })
+                .collect()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    Json(serde_json::json!({
+        "peers": peers,
+        "count": peers.len(),
+    }))
+}
+
+async fn network_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let uptime = state.start_time.elapsed().as_secs();
+    
+    let peers = if let Some(net_lock) = &state.network {
+        let guard = net_lock.read();
+        guard.as_ref().map(|n| n.connected_peers()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    Json(NetworkStatsResponse {
+        total_chunks: state.chunk_store.count(),
+        total_storage_bytes: state.chunk_store.total_size(),
+        published_sites: state.bundle_store.get_all_published_sites().unwrap_or_default().len(),
+        hosted_sites: state.bundle_store.get_all_hosted_sites().unwrap_or_default().len(),
+        connected_peers: peers,
+        uptime_seconds: uptime,
+    })
+}
+
+async fn peer_viewer_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let uptime = state.start_time.elapsed().as_secs();
+    
+    let (running, peer_id, peers, addresses) = if let Some(net_lock) = &state.network {
+        let guard = net_lock.read();
+        if let Some(network) = guard.as_ref() {
+            (
+                true,
+                network.peer_id().to_string(),
+                network.connected_peer_ids(),
+                network.listen_addresses(),
+            )
+        } else {
+            (false, String::new(), vec![], vec![])
+        }
+    } else {
+        (false, String::new(), vec![], vec![])
+    };
+
+    let published = state.bundle_store.get_all_published_sites().unwrap_or_default();
+    let hosted = state.bundle_store.get_all_hosted_sites().unwrap_or_default();
+    let chunks = state.chunk_store.count();
+    let storage = state.chunk_store.total_size();
+
+    Html(format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GrabNet Peer Viewer</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e4e4e7;
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        h1 {{
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            background: linear-gradient(90deg, #4ade80, #22d3ee);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .subtitle {{ color: #a1a1aa; margin-bottom: 30px; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+        .card {{
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 24px;
+            backdrop-filter: blur(10px);
+        }}
+        .card h2 {{
+            font-size: 1.1rem;
+            color: #a1a1aa;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        .stat {{
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #fff;
+        }}
+        .stat.green {{ color: #4ade80; }}
+        .stat.blue {{ color: #22d3ee; }}
+        .stat.purple {{ color: #a78bfa; }}
+        .stat.orange {{ color: #fb923c; }}
+        .status-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }}
+        .status-badge.online {{ background: rgba(74, 222, 128, 0.2); color: #4ade80; }}
+        .status-badge.offline {{ background: rgba(239, 68, 68, 0.2); color: #ef4444; }}
+        .status-dot {{
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }}
+        .status-badge.online .status-dot {{ background: #4ade80; }}
+        .status-badge.offline .status-dot {{ background: #ef4444; }}
+        @keyframes pulse {{
+            0%, 100% {{ opacity: 1; }}
+            50% {{ opacity: 0.5; }}
+        }}
+        .peer-list {{ margin-top: 20px; }}
+        .peer-item {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            background: rgba(255,255,255,0.03);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.85rem;
+            word-break: break-all;
+        }}
+        .peer-dot {{
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #4ade80;
+            flex-shrink: 0;
+        }}
+        .section {{ margin-bottom: 30px; }}
+        .section-title {{
+            font-size: 1.25rem;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .site-item {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            background: rgba(255,255,255,0.03);
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }}
+        .site-name {{ font-weight: 500; }}
+        .site-id {{ color: #71717a; font-size: 0.8rem; font-family: monospace; }}
+        .site-rev {{ color: #a1a1aa; font-size: 0.875rem; }}
+        .empty-state {{ color: #71717a; text-align: center; padding: 40px; }}
+        .address-item {{
+            padding: 8px 12px;
+            background: rgba(34, 211, 238, 0.1);
+            border-radius: 6px;
+            margin-bottom: 6px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: #22d3ee;
+        }}
+        .refresh-btn {{
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            padding: 14px 24px;
+            background: linear-gradient(135deg, #4ade80, #22d3ee);
+            color: #1a1a2e;
+            border: none;
+            border-radius: 30px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 4px 20px rgba(74, 222, 128, 0.3);
+            transition: transform 0.2s;
+        }}
+        .refresh-btn:hover {{ transform: scale(1.05); }}
+        .peer-id-box {{
+            background: rgba(0,0,0,0.3);
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 0.75rem;
+            word-break: break-all;
+            margin-top: 10px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌐 GrabNet Network</h1>
+        <p class="subtitle">Real-time P2P network status and peer connections</p>
+
+        <div class="grid">
+            <div class="card">
+                <h2>Network Status</h2>
+                <div class="status-badge {}">
+                    <span class="status-dot"></span>
+                    {}
+                </div>
+                <div class="peer-id-box">
+                    <strong>Peer ID:</strong><br>{}
+                </div>
+            </div>
+            <div class="card">
+                <h2>Connected Peers</h2>
+                <div class="stat green">{}</div>
+            </div>
+            <div class="card">
+                <h2>Published Sites</h2>
+                <div class="stat blue">{}</div>
+            </div>
+            <div class="card">
+                <h2>Hosted Sites</h2>
+                <div class="stat purple">{}</div>
+            </div>
+            <div class="card">
+                <h2>Storage Chunks</h2>
+                <div class="stat orange">{}</div>
+            </div>
+            <div class="card">
+                <h2>Total Storage</h2>
+                <div class="stat">{}</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">📡 Listen Addresses</h2>
+            <div class="card">
+                {}
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">🔗 Connected Peers ({})</h2>
+            <div class="card">
+                {}
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">📤 Published Sites</h2>
+            <div class="card">
+                {}
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">📥 Hosted Sites</h2>
+            <div class="card">
+                {}
+            </div>
+        </div>
+    </div>
+
+    <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+
+    <script>
+        // Auto-refresh every 10 seconds
+        setTimeout(() => location.reload(), 10000);
+    </script>
+</body>
+</html>"#,
+        if running { "online" } else { "offline" },
+        if running { "Online" } else { "Offline" },
+        if running { &peer_id } else { "Not connected" },
+        peers.len(),
+        published.len(),
+        hosted.len(),
+        chunks,
+        format_bytes(storage),
+        if addresses.is_empty() {
+            "<div class='empty-state'>No listen addresses</div>".to_string()
+        } else {
+            addresses.iter().map(|a| format!("<div class='address-item'>{}</div>", a)).collect::<Vec<_>>().join("")
+        },
+        peers.len(),
+        if peers.is_empty() {
+            "<div class='empty-state'>No peers connected</div>".to_string()
+        } else {
+            peers.iter().map(|p| format!("<div class='peer-item'><span class='peer-dot'></span>{}</div>", p)).collect::<Vec<_>>().join("")
+        },
+        if published.is_empty() {
+            "<div class='empty-state'>No published sites</div>".to_string()
+        } else {
+            published.iter().map(|s| format!(
+                "<div class='site-item'><div><div class='site-name'>{}</div><div class='site-id'>{}</div></div><div class='site-rev'>rev {}</div></div>",
+                s.name, crate::crypto::SiteIdExt::to_base58(&s.site_id), s.revision
+            )).collect::<Vec<_>>().join("")
+        },
+        if hosted.is_empty() {
+            "<div class='empty-state'>No hosted sites</div>".to_string()
+        } else {
+            hosted.iter().map(|s| format!(
+                "<div class='site-item'><div><div class='site-name'>{}</div><div class='site-id'>{}</div></div><div class='site-rev'>rev {}</div></div>",
+                s.name, crate::crypto::SiteIdExt::to_base58(&s.site_id), s.revision
+            )).collect::<Vec<_>>().join("")
+        },
+    ))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }

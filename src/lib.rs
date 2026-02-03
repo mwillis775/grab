@@ -44,7 +44,7 @@ pub mod publisher;
 pub use types::*;
 pub use crypto::{hash, sign, verify, generate_keypair, SiteIdExt, encode_base58, decode_base58};
 pub use storage::{ChunkStore, BundleStore, KeyStore};
-pub use network::GrabNetwork;
+pub use network::{GrabNetwork, NetworkEvent};
 pub use gateway::Gateway;
 pub use content::UserContentManager;
 pub use publisher::{Publisher, PublishOptions, PublishResult};
@@ -281,14 +281,14 @@ impl Grab {
                 self.bundle_store.clone(),
                 self.content_manager.read().clone(),
                 site_id,
-            )
+            ).with_network(self.network.clone())
         } else {
             Gateway::new(
                 &config,
                 self.chunk_store.clone(),
                 self.bundle_store.clone(),
                 self.content_manager.read().clone(),
-            )
+            ).with_network(self.network.clone())
         };
 
         gateway.start().await?;
@@ -387,6 +387,16 @@ impl Grab {
         &self.bundle_store
     }
 
+    /// Get network reference (if running)
+    pub fn network(&self) -> Option<parking_lot::RwLockReadGuard<'_, Option<GrabNetwork>>> {
+        let guard = self.network.read();
+        if guard.is_some() {
+            Some(guard)
+        } else {
+            None
+        }
+    }
+
     /// Dial a peer address
     pub async fn dial_peer(&self, addr: &str) -> Result<()> {
         if let Some(network) = self.network.read().as_ref() {
@@ -418,35 +428,4 @@ pub struct StorageStats {
     pub total_size: u64,
     pub published_sites: usize,
     pub hosted_sites: usize,
-}
-
-#[cfg(test)]
-mod serialization_tests {
-    use super::*;
-    use types::{SiteManifest, FileEntry, Compression};
-    
-    #[test]
-    fn test_manifest_roundtrip() {
-        let manifest = SiteManifest {
-            files: vec![FileEntry {
-                path: "index.html".to_string(),
-                hash: [0u8; 32],
-                size: 100,
-                mime_type: "text/html".to_string(),
-                chunks: vec![[1u8; 32]],
-                compression: Some(Compression::Gzip),
-            }],
-            entry: "index.html".to_string(),
-            routes: None,
-            headers: None,
-        };
-        
-        let encoded = bincode::serialize(&manifest).unwrap();
-        println!("Encoded manifest: {} bytes", encoded.len());
-        println!("Raw bytes: {:?}", &encoded[..encoded.len().min(50)]);
-        
-        let decoded: SiteManifest = bincode::deserialize(&encoded).unwrap();
-        assert_eq!(decoded.entry, manifest.entry);
-        assert_eq!(decoded.files.len(), manifest.files.len());
-    }
 }

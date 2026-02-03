@@ -126,6 +126,12 @@ enum Commands {
         default_site: Option<String>,
     },
 
+    /// Bootstrap node management
+    Bootstrap {
+        #[command(subcommand)]
+        action: BootstrapAction,
+    },
+
     /// Show storage statistics
     Stats,
 }
@@ -149,6 +155,9 @@ enum NodeAction {
 
     /// Show node status
     Status,
+
+    /// List connected peers
+    Peers,
 
     /// Connect to a peer
     Connect {
@@ -187,6 +196,30 @@ enum KeysAction {
     },
 }
 
+#[derive(Subcommand)]
+enum BootstrapAction {
+    /// List all bootstrap nodes
+    List,
+
+    /// Add a custom bootstrap node
+    Add {
+        /// Node name
+        name: String,
+        
+        /// Multiaddress (e.g., /ip4/1.2.3.4/tcp/4001)
+        address: String,
+    },
+
+    /// Remove a custom bootstrap node
+    Remove {
+        /// Node name
+        name: String,
+    },
+
+    /// Test connectivity to bootstrap nodes
+    Test,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -199,8 +232,15 @@ async fn main() -> Result<()> {
     };
     fmt().with_env_filter(filter).init();
 
+    // Get data directory (clone for use in Bootstrap command)
+    let data_dir = cli.data_dir.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".grab")
+    });
+
     // Create GrabNet instance
-    let grab = Grab::new(cli.data_dir).await?;
+    let grab = Grab::new(Some(data_dir.clone())).await?;
 
     match cli.command {
         Commands::Publish {
@@ -404,8 +444,44 @@ async fn main() -> Result<()> {
                             println!("  Peer ID: {}", peer_id);
                         }
                         println!("  Peers:   {}", status.peers);
+                        println!();
+                        if !status.addresses.is_empty() {
+                            println!("Listen addresses:");
+                            for addr in &status.addresses {
+                                println!("  {}", addr);
+                            }
+                        }
                     } else {
                         println!("🔴 Node is not running");
+                    }
+                }
+
+                NodeAction::Peers => {
+                    let status = grab.network_status();
+                    if !status.running {
+                        println!("🔴 Node is not running");
+                        println!();
+                        println!("Start it with: grab node start");
+                        return Ok(());
+                    }
+
+                    println!("🔗 Connected Peers: {}", status.peers);
+                    println!();
+                    
+                    // Get detailed peer list
+                    if let Some(guard) = grab.network() {
+                        if let Some(network) = guard.as_ref() {
+                            let peers = network.connected_peer_ids();
+                            if peers.is_empty() {
+                                println!("  No peers connected");
+                                println!();
+                                println!("Connect to a peer with: grab node connect <address>");
+                            } else {
+                                for peer in peers {
+                                    println!("  • {}", peer);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -556,6 +632,86 @@ async fn main() -> Result<()> {
             
             tokio::signal::ctrl_c().await?;
             grab.stop_gateway().await?;
+        }
+
+        Commands::Bootstrap { action } => {
+            let mut config = grabnet::network::BootstrapConfig::load_or_default(&data_dir)?;
+            
+            match action {
+                BootstrapAction::List => {
+                    println!("🌐 Bootstrap Nodes:");
+                    println!();
+                    
+                    println!("Official:");
+                    for node in &config.official {
+                        let status = if node.enabled { "✓" } else { "✗" };
+                        println!("  {} {} [{}]", status, node.name, node.region.as_deref().unwrap_or("unknown"));
+                        for addr in &node.addresses {
+                            println!("      {}", addr);
+                        }
+                    }
+                    
+                    if !config.community.is_empty() {
+                        println!();
+                        println!("Community:");
+                        for node in &config.community {
+                            let status = if node.enabled { "✓" } else { "✗" };
+                            println!("  {} {}", status, node.name);
+                            for addr in &node.addresses {
+                                println!("      {}", addr);
+                            }
+                        }
+                    }
+                    
+                    if !config.custom.is_empty() {
+                        println!();
+                        println!("Custom:");
+                        for node in &config.custom {
+                            let status = if node.enabled { "✓" } else { "✗" };
+                            println!("  {} {}", status, node.name);
+                            for addr in &node.addresses {
+                                println!("      {}", addr);
+                            }
+                        }
+                    }
+                    
+                    println!();
+                    println!("mDNS: {}", if config.mdns_enabled { "enabled" } else { "disabled" });
+                    println!("Minimum peers: {}", config.min_peers);
+                }
+                
+                BootstrapAction::Add { name, address } => {
+                    config.add_custom(name.clone(), vec![address.clone()]);
+                    config.save(&data_dir)?;
+                    println!("✓ Added bootstrap node: {}", name);
+                    println!("  Address: {}", address);
+                }
+                
+                BootstrapAction::Remove { name } => {
+                    if config.remove_custom(&name) {
+                        config.save(&data_dir)?;
+                        println!("✓ Removed bootstrap node: {}", name);
+                    } else {
+                        println!("❌ Custom node not found: {}", name);
+                        println!("   Note: Only custom nodes can be removed");
+                    }
+                }
+                
+                BootstrapAction::Test => {
+                    println!("🔍 Testing bootstrap node connectivity...");
+                    println!();
+                    
+                    let addresses = config.get_enabled_addresses();
+                    for addr in addresses {
+                        print!("  {} ... ", addr);
+                        if grabnet::network::bootstrap::check_reachable(&addr).await {
+                            println!("✓ reachable");
+                        } else {
+                            println!("✗ unreachable");
+                        }
+                    }
+                }
+            }
         }
 
         Commands::Stats => {
