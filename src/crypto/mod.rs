@@ -1,9 +1,9 @@
 //! Cryptographic primitives for GrabNet
 
 mod hash;
-mod signing;
 mod merkle;
+mod signing;
 
 pub use hash::*;
-pub use signing::*;
 pub use merkle::*;
+pub use signing::*;

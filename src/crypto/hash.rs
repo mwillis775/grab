@@ -1,6 +1,6 @@
 //! BLAKE3 hashing utilities
 
-use crate::types::{ChunkId, SiteId, PublicKey};
+use crate::types::{ChunkId, PublicKey, SiteId};
 
 /// Hash data using BLAKE3
 #[inline]
@@ -21,10 +21,10 @@ pub fn hash_multi(parts: &[&[u8]]) -> [u8; 32] {
 pub trait SiteIdExt {
     /// Generate a stable site ID from publisher key and site name
     fn generate(publisher: &PublicKey, name: &str) -> SiteId;
-    
+
     /// Encode as base58 string
     fn to_base58(&self) -> String;
-    
+
     /// Decode from base58 string
     fn from_base58(s: &str) -> Option<SiteId>;
 }
@@ -33,11 +33,11 @@ impl SiteIdExt for SiteId {
     fn generate(publisher: &PublicKey, name: &str) -> SiteId {
         hash_multi(&[publisher, name.as_bytes()])
     }
-    
+
     fn to_base58(&self) -> String {
         bs58::encode(self).into_string()
     }
-    
+
     fn from_base58(s: &str) -> Option<SiteId> {
         let bytes = bs58::decode(s).into_vec().ok()?;
         if bytes.len() != 32 {
@@ -74,10 +74,10 @@ mod tests {
         let data = b"hello world";
         let h = hash(data);
         assert_eq!(h.len(), 32);
-        
+
         // Same input = same output
         assert_eq!(h, hash(data));
-        
+
         // Different input = different output
         assert_ne!(h, hash(b"hello world!"));
     }
@@ -86,15 +86,15 @@ mod tests {
     fn test_site_id() {
         let publisher = [1u8; 32];
         let name = "my-site";
-        
+
         let id = SiteId::generate(&publisher, name);
-        
+
         // Stable: same inputs = same ID
         assert_eq!(id, SiteId::generate(&publisher, name));
-        
+
         // Different name = different ID
         assert_ne!(id, SiteId::generate(&publisher, "other-site"));
-        
+
         // Different publisher = different ID
         let other_publisher = [2u8; 32];
         assert_ne!(id, SiteId::generate(&other_publisher, name));

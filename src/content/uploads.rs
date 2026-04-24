@@ -1,15 +1,15 @@
 //! User upload management for GrabNet sites
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::types::{SiteId, ChunkId};
+use crate::crypto::{encode_base58, hash};
 use crate::storage::ChunkStore;
-use crate::crypto::{hash, encode_base58};
+use crate::types::{ChunkId, SiteId};
 
 /// Upload policy for a site
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +31,7 @@ pub struct UploadPolicy {
 impl Default for UploadPolicy {
     fn default() -> Self {
         Self {
-            max_file_size: 10 * 1024 * 1024, // 10 MB
+            max_file_size: 10 * 1024 * 1024,         // 10 MB
             max_storage_per_user: 100 * 1024 * 1024, // 100 MB
             allowed_types: vec![],
             require_auth: false,
@@ -141,9 +141,12 @@ impl UserContentManager {
         };
 
         // Generate uploader ID
-        let uploader = uploader_id
-            .map(String::from)
-            .unwrap_or_else(|| format!("anon_{}", encode_base58(&hash(&rand::random::<[u8; 8]>())[..8])));
+        let uploader = uploader_id.map(String::from).unwrap_or_else(|| {
+            format!(
+                "anon_{}",
+                encode_base58(&hash(&rand::random::<[u8; 8]>())[..8])
+            )
+        });
 
         // Check authentication requirement
         if policy.require_auth && uploader_id.is_none() {
@@ -157,9 +160,10 @@ impl UserContentManager {
 
         // Check MIME type
         if !policy.allowed_types.is_empty() {
-            let allowed = policy.allowed_types.iter().any(|t| {
-                mime_type == t || mime_type.starts_with(&t.replace("*", ""))
-            });
+            let allowed = policy
+                .allowed_types
+                .iter()
+                .any(|t| mime_type == t || mime_type.starts_with(&t.replace("*", "")));
             if !allowed {
                 anyhow::bail!("File type not allowed: {}", mime_type);
             }
@@ -212,12 +216,16 @@ impl UserContentManager {
         };
 
         // Store
-        self.uploads.write().insert(upload_id.clone(), upload.clone());
-        self.uploads_by_site.write()
+        self.uploads
+            .write()
+            .insert(upload_id.clone(), upload.clone());
+        self.uploads_by_site
+            .write()
             .entry(*site_id)
             .or_default()
             .push(upload_id.clone());
-        self.uploads_by_user.write()
+        self.uploads_by_user
+            .write()
             .entry(uploader.clone())
             .or_default()
             .push(upload_id);
@@ -252,7 +260,9 @@ impl UserContentManager {
 
     /// List uploads for a site
     pub fn list_site_uploads(&self, site_id: &SiteId) -> Vec<UserUpload> {
-        let ids = self.uploads_by_site.read()
+        let ids = self
+            .uploads_by_site
+            .read()
             .get(site_id)
             .cloned()
             .unwrap_or_default();
@@ -313,7 +323,8 @@ impl UserContentManager {
         let hour_ago = now - 3600 * 1000;
 
         let rates = self.rate_limits.read();
-        let recent = rates.get(user_id)
+        let recent = rates
+            .get(user_id)
             .map(|times| times.iter().filter(|&&t| t > hour_ago).count())
             .unwrap_or(0);
 
@@ -336,7 +347,9 @@ impl UserContentManager {
     }
 
     fn get_user_storage(&self, user_id: &str) -> usize {
-        let ids = self.uploads_by_user.read()
+        let ids = self
+            .uploads_by_user
+            .read()
             .get(user_id)
             .cloned()
             .unwrap_or_default();
@@ -363,13 +376,15 @@ mod tests {
         let site_id = [1u8; 32];
         manager.set_policy(&site_id, UploadPolicy::default());
 
-        let upload = manager.upload(
-            &site_id,
-            "test.txt",
-            "text/plain",
-            b"hello world",
-            Some("user1"),
-        )?.unwrap();
+        let upload = manager
+            .upload(
+                &site_id,
+                "test.txt",
+                "text/plain",
+                b"hello world",
+                Some("user1"),
+            )?
+            .unwrap();
 
         assert_eq!(upload.filename, "test.txt");
         assert_eq!(upload.status, UploadStatus::Approved);
@@ -388,18 +403,17 @@ mod tests {
         let manager = UserContentManager::new(chunk_store);
 
         let site_id = [1u8; 32];
-        manager.set_policy(&site_id, UploadPolicy {
-            moderation: ModerationMode::Pre,
-            ..Default::default()
-        });
-
-        let upload = manager.upload(
+        manager.set_policy(
             &site_id,
-            "test.txt",
-            "text/plain",
-            b"needs review",
-            None,
-        )?.unwrap();
+            UploadPolicy {
+                moderation: ModerationMode::Pre,
+                ..Default::default()
+            },
+        );
+
+        let upload = manager
+            .upload(&site_id, "test.txt", "text/plain", b"needs review", None)?
+            .unwrap();
 
         assert_eq!(upload.status, UploadStatus::Pending);
 

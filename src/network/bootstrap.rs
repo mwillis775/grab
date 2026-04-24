@@ -1,8 +1,8 @@
 //! Bootstrap node discovery and management
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use anyhow::Result;
 
 /// Known bootstrap nodes for GrabNet
 /// These are the initial nodes new peers connect to for network discovery
@@ -44,9 +44,7 @@ impl Default for BootstrapConfig {
                 // Primary US bootstrap node
                 BootstrapNode {
                     name: "grabnet-us-east".to_string(),
-                    addresses: vec![
-                        "/dns4/bootstrap-us.grabnet.io/tcp/4001".to_string(),
-                    ],
+                    addresses: vec!["/dns4/bootstrap-us.grabnet.io/tcp/4001".to_string()],
                     peer_id: None, // Will be set when deployed
                     region: Some("us-east".to_string()),
                     enabled: true,
@@ -54,9 +52,7 @@ impl Default for BootstrapConfig {
                 // Primary EU bootstrap node
                 BootstrapNode {
                     name: "grabnet-eu-west".to_string(),
-                    addresses: vec![
-                        "/dns4/bootstrap-eu.grabnet.io/tcp/4001".to_string(),
-                    ],
+                    addresses: vec!["/dns4/bootstrap-eu.grabnet.io/tcp/4001".to_string()],
                     peer_id: None,
                     region: Some("eu-west".to_string()),
                     enabled: true,
@@ -75,7 +71,7 @@ impl BootstrapConfig {
     /// Load bootstrap config from a file, or create default
     pub fn load_or_default(data_dir: &Path) -> Result<Self> {
         let config_path = data_dir.join("bootstrap.json");
-        
+
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             Ok(serde_json::from_str(&contents)?)
@@ -97,25 +93,25 @@ impl BootstrapConfig {
     /// Get all enabled bootstrap addresses
     pub fn get_enabled_addresses(&self) -> Vec<String> {
         let mut addresses = Vec::new();
-        
+
         for node in &self.official {
             if node.enabled {
                 addresses.extend(node.addresses.clone());
             }
         }
-        
+
         for node in &self.community {
             if node.enabled {
                 addresses.extend(node.addresses.clone());
             }
         }
-        
+
         for node in &self.custom {
             if node.enabled {
                 addresses.extend(node.addresses.clone());
             }
         }
-        
+
         addresses
     }
 
@@ -148,9 +144,9 @@ impl BootstrapConfig {
 
     /// Get count of enabled nodes
     pub fn enabled_count(&self) -> usize {
-        self.official.iter().filter(|n| n.enabled).count() +
-        self.community.iter().filter(|n| n.enabled).count() +
-        self.custom.iter().filter(|n| n.enabled).count()
+        self.official.iter().filter(|n| n.enabled).count()
+            + self.community.iter().filter(|n| n.enabled).count()
+            + self.custom.iter().filter(|n| n.enabled).count()
     }
 }
 
@@ -164,21 +160,21 @@ pub const DEV_BOOTSTRAP_PEERS: &[&str] = &[
 pub async fn check_reachable(addr: &str) -> bool {
     use tokio::net::TcpStream;
     use tokio::time::{timeout, Duration};
-    
+
     // Extract host:port from multiaddr (simplified)
     let parts: Vec<&str> = addr.split('/').collect();
     if parts.len() < 5 {
         return false;
     }
-    
+
     let host = parts[2];
     let port: u16 = match parts[4].parse() {
         Ok(p) => p,
         Err(_) => return false,
     };
-    
+
     let connect_addr = format!("{}:{}", host, port);
-    
+
     match timeout(Duration::from_secs(5), TcpStream::connect(&connect_addr)).await {
         Ok(Ok(_)) => true,
         _ => false,
@@ -199,9 +195,12 @@ mod tests {
     #[test]
     fn test_add_remove_custom() {
         let mut config = BootstrapConfig::default();
-        config.add_custom("test-node".to_string(), vec!["/ip4/1.2.3.4/tcp/4001".to_string()]);
+        config.add_custom(
+            "test-node".to_string(),
+            vec!["/ip4/1.2.3.4/tcp/4001".to_string()],
+        );
         assert_eq!(config.custom.len(), 1);
-        
+
         config.remove_custom("test-node");
         assert_eq!(config.custom.len(), 0);
     }

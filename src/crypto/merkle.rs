@@ -1,7 +1,7 @@
 //! Merkle tree for content verification and delta sync
 
-use crate::types::MerkleProof;
 use super::hash;
+use crate::types::MerkleProof;
 
 /// A Merkle tree for content verification
 #[derive(Debug, Clone)]
@@ -113,20 +113,20 @@ impl MerkleTree {
     /// Get leaves that differ between two trees
     pub fn diff(&self, other: &MerkleTree) -> Vec<usize> {
         let mut different = Vec::new();
-        
+
         for (i, (a, b)) in self.leaves.iter().zip(other.leaves.iter()).enumerate() {
             if a != b {
                 different.push(i);
             }
         }
-        
+
         // Handle size differences
         if self.leaves.len() < other.leaves.len() {
             for i in self.leaves.len()..other.leaves.len() {
                 different.push(i);
             }
         }
-        
+
         different
     }
 
@@ -171,7 +171,7 @@ mod tests {
 
         let tree = MerkleTree::new(leaves.clone());
         assert_eq!(tree.len(), 4);
-        
+
         // Root should be deterministic
         let tree2 = MerkleTree::new(leaves);
         assert_eq!(tree.root(), tree2.root());
@@ -179,12 +179,7 @@ mod tests {
 
     #[test]
     fn test_merkle_proof() {
-        let leaves = vec![
-            hash(b"a"),
-            hash(b"b"),
-            hash(b"c"),
-            hash(b"d"),
-        ];
+        let leaves = vec![hash(b"a"), hash(b"b"), hash(b"c"), hash(b"d")];
 
         let tree = MerkleTree::new(leaves);
 

@@ -1,10 +1,10 @@
 //! Wire protocol for GrabNet P2P communication
 
-use std::io;
 use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::request_response;
 use libp2p::StreamProtocol;
+use std::io;
 
 use crate::types::{GrabRequest, GrabResponse};
 
@@ -57,8 +57,7 @@ impl request_response::Codec for GrabCodec {
         io.read_exact(&mut buf).await?;
 
         // Decode
-        bincode::deserialize(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn read_response<T>(
@@ -84,8 +83,7 @@ impl request_response::Codec for GrabCodec {
         let mut buf = vec![0u8; len];
         io.read_exact(&mut buf).await?;
 
-        bincode::deserialize(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn write_request<T>(

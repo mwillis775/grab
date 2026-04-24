@@ -3,15 +3,16 @@
 //! Provides policies and mechanisms for ensuring content availability
 //! across multiple peers in the network.
 
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
-use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
-use crate::types::{SiteId, ChunkId};
 use crate::crypto::SiteIdExt;
+use crate::erasure::ErasureConfig;
+use crate::types::{ChunkId, SiteId};
 
 /// Replication policy for a site
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,8 @@ pub struct ReplicationPolicy {
     pub announce_interval_secs: u64,
     /// Whether to actively seek more replicas if below minimum
     pub auto_replicate: bool,
+    /// Erasure coding mode: if Some, use sharded storage instead of full replication
+    pub erasure: Option<ErasureConfig>,
 }
 
 impl Default for ReplicationPolicy {
@@ -36,6 +39,7 @@ impl Default for ReplicationPolicy {
             priority: 5,
             announce_interval_secs: 3600, // 1 hour
             auto_replicate: true,
+            erasure: None, // Full replication by default for backwards compat
         }
     }
 }
@@ -143,7 +147,7 @@ impl ReplicationManager {
 
         let hosts = self.site_hosts.read();
         let host_count = hosts.get(site_id).map(|h| h.len()).unwrap_or(0);
-        
+
         host_count < policy.min_replicas
     }
 
@@ -151,7 +155,7 @@ impl ReplicationManager {
     pub fn should_announce(&self, site_id: &SiteId) -> bool {
         let policy = self.get_policy(site_id);
         let interval = Duration::from_secs(policy.announce_interval_secs);
-        
+
         let last = self.last_announce.read().get(site_id).copied();
         match last {
             Some(t) => t.elapsed() >= interval,
@@ -167,34 +171,37 @@ impl ReplicationManager {
     /// Get sites that need attention (below min replicas or unhealthy)
     pub fn get_sites_needing_attention(&self) -> Vec<(SiteId, SiteHealth)> {
         let mut result = Vec::new();
-        
+
         for (site_id, health) in self.health_cache.read().iter() {
             if health.status != HealthStatus::Healthy {
                 result.push((*site_id, health.clone()));
             }
         }
-        
+
         // Also check sites below min replicas
         let policies = self.policies.read();
         let hosts = self.site_hosts.read();
-        
+
         for (site_id, policy) in policies.iter() {
             let host_count = hosts.get(site_id).map(|h| h.len()).unwrap_or(0);
             if host_count < policy.min_replicas {
                 // Add if not already in result
                 if !result.iter().any(|(id, _)| id == site_id) {
-                    result.push((*site_id, SiteHealth {
-                        site_id: *site_id,
-                        known_hosts: host_count,
-                        verified_hosts: 0,
-                        last_check: 0,
-                        status: HealthStatus::Degraded,
-                        missing_chunks: vec![],
-                    }));
+                    result.push((
+                        *site_id,
+                        SiteHealth {
+                            site_id: *site_id,
+                            known_hosts: host_count,
+                            verified_hosts: 0,
+                            last_check: 0,
+                            status: HealthStatus::Degraded,
+                            missing_chunks: vec![],
+                        },
+                    ));
                 }
             }
         }
-        
+
         result
     }
 
@@ -203,17 +210,17 @@ impl ReplicationManager {
         let policies = self.policies.read();
         let hosts = self.site_hosts.read();
         let health = self.health_cache.read();
-        
+
         let total_sites = policies.len();
         let mut healthy = 0;
         let mut degraded = 0;
         let mut critical = 0;
         let mut total_replicas = 0;
-        
+
         for site_id in policies.keys() {
             let host_count = hosts.get(site_id).map(|h| h.len()).unwrap_or(0);
             total_replicas += host_count;
-            
+
             if let Some(h) = health.get(site_id) {
                 match h.status {
                     HealthStatus::Healthy => healthy += 1,
@@ -223,7 +230,7 @@ impl ReplicationManager {
                 }
             }
         }
-        
+
         ReplicationStats {
             total_sites,
             healthy_sites: healthy,
@@ -264,18 +271,21 @@ mod tests {
     fn test_replication_policy() {
         let manager = ReplicationManager::new();
         let site_id = [0u8; 32];
-        
+
         // Default policy
         let policy = manager.get_policy(&site_id);
         assert_eq!(policy.min_replicas, 3);
-        
+
         // Custom policy
-        manager.set_policy(site_id, ReplicationPolicy {
-            min_replicas: 5,
-            max_replicas: 20,
-            ..Default::default()
-        });
-        
+        manager.set_policy(
+            site_id,
+            ReplicationPolicy {
+                min_replicas: 5,
+                max_replicas: 20,
+                ..Default::default()
+            },
+        );
+
         let policy = manager.get_policy(&site_id);
         assert_eq!(policy.min_replicas, 5);
     }
@@ -284,13 +294,13 @@ mod tests {
     fn test_host_tracking() {
         let manager = ReplicationManager::new();
         let site_id = [1u8; 32];
-        
+
         manager.add_host(site_id, "peer1".to_string());
         manager.add_host(site_id, "peer2".to_string());
-        
+
         let hosts = manager.get_hosts(&site_id);
         assert_eq!(hosts.len(), 2);
-        
+
         manager.remove_host(&site_id, "peer1");
         let hosts = manager.get_hosts(&site_id);
         assert_eq!(hosts.len(), 1);
@@ -300,21 +310,24 @@ mod tests {
     fn test_needs_replication() {
         let manager = ReplicationManager::new();
         let site_id = [2u8; 32];
-        
-        manager.set_policy(site_id, ReplicationPolicy {
-            min_replicas: 3,
-            auto_replicate: true,
-            ..Default::default()
-        });
-        
+
+        manager.set_policy(
+            site_id,
+            ReplicationPolicy {
+                min_replicas: 3,
+                auto_replicate: true,
+                ..Default::default()
+            },
+        );
+
         // No hosts - needs replication
         assert!(manager.needs_replication(&site_id));
-        
+
         // Add hosts
         manager.add_host(site_id, "peer1".to_string());
         manager.add_host(site_id, "peer2".to_string());
         assert!(manager.needs_replication(&site_id)); // Still need 1 more
-        
+
         manager.add_host(site_id, "peer3".to_string());
         assert!(!manager.needs_replication(&site_id)); // Met minimum
     }

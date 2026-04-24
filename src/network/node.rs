@@ -1,26 +1,27 @@
 //! GrabNet P2P node implementation
 
-use std::sync::Arc;
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use libp2p::{
-    identity, noise, tcp, yamux,
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
-    swarm::SwarmEvent,
-    request_response::{self},
-    kad::{self, QueryResult, QueryId},
     gossipsub::{self, IdentTopic},
-    mdns, identify,
+    identify, identity,
+    kad::{self, QueryId, QueryResult},
+    mdns, noise,
+    request_response::{self},
+    swarm::SwarmEvent,
+    tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use parking_lot::RwLock;
-use tokio::sync::{mpsc, oneshot, broadcast};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use super::behaviour::{GrabBehaviour, GrabBehaviourEvent};
-use crate::types::{Config, SiteId, WebBundle, GrabRequest, GrabResponse, PeerRecord, ChunkId};
-use crate::storage::{ChunkStore, BundleStore, KeyStore};
 use crate::crypto::SiteIdExt;
+use crate::erasure::ShardStore;
+use crate::storage::{BundleStore, ChunkStore, KeyStore};
+use crate::types::{ChunkId, Config, GrabRequest, GrabResponse, PeerRecord, SiteId, WebBundle};
 
 /// Default bootstrap peers for the GrabNet network
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
@@ -55,7 +56,11 @@ pub enum NetworkEvent {
     /// A peer disconnected
     PeerDisconnected(PeerId),
     /// Received a site announcement
-    SiteAnnounced { site_id: SiteId, peer_id: PeerId, revision: u64 },
+    SiteAnnounced {
+        site_id: SiteId,
+        peer_id: PeerId,
+        revision: u64,
+    },
     /// Received a site update
     SiteUpdated { site_id: SiteId, revision: u64 },
     /// Bootstrap complete
@@ -84,21 +89,22 @@ impl GrabNetwork {
         chunk_store: Arc<ChunkStore>,
         bundle_store: Arc<BundleStore>,
         key_store: Arc<KeyStore>,
+        shard_store: Arc<ShardStore>,
     ) -> Result<Self> {
         // Get or create persistent identity
         let (public_key, private_key) = key_store.get_or_create("node")?;
-        
+
         // Convert to libp2p identity format
         // Ed25519 secret key is 32 bytes, but libp2p expects 64-byte format (seed + public)
         let mut keypair_bytes = [0u8; 64];
         keypair_bytes[..32].copy_from_slice(&private_key);
         keypair_bytes[32..].copy_from_slice(&public_key);
-        
+
         let ed25519_keypair = identity::ed25519::Keypair::try_from_bytes(&mut keypair_bytes)
             .map_err(|e| anyhow!("Failed to load identity: {}", e))?;
         let local_key = identity::Keypair::from(ed25519_keypair);
         let local_peer_id = PeerId::from(local_key.public());
-        
+
         tracing::info!("Local peer ID: {}", local_peer_id);
 
         // Build swarm
@@ -109,23 +115,20 @@ impl GrabNetwork {
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_behaviour(|key| {
-                GrabBehaviour::new(local_peer_id, key.public())
-            })?
-            .with_swarm_config(|cfg| {
-                cfg.with_idle_connection_timeout(Duration::from_secs(120))
-            })
+            .with_behaviour(|key| GrabBehaviour::new(local_peer_id, key.public()))?
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(120)))
             .build();
 
         // Command channel
         let (command_tx, command_rx) = mpsc::channel(256);
-        
+
         // Event broadcast channel
         let (event_tx, _) = broadcast::channel(256);
 
         // Clone stores for the event loop
         let chunk_store_clone = chunk_store.clone();
         let bundle_store_clone = bundle_store.clone();
+        let shard_store_clone = shard_store.clone();
         let announced_sites = Arc::new(RwLock::new(HashMap::new()));
         let announced_sites_clone = announced_sites.clone();
         let connected_peers = Arc::new(RwLock::new(HashSet::new()));
@@ -135,7 +138,8 @@ impl GrabNetwork {
         // Start event loop
         let listen_addrs = config.network.listen_addresses.clone();
         let bootstrap_peers = config.network.bootstrap_peers.clone();
-        
+        let erasure_config = config.storage.erasure;
+
         let task = tokio::spawn(async move {
             run_swarm(
                 swarm,
@@ -144,10 +148,13 @@ impl GrabNetwork {
                 bootstrap_peers,
                 chunk_store_clone,
                 bundle_store_clone,
+                shard_store_clone,
                 announced_sites_clone,
                 connected_peers_clone,
                 event_tx_clone,
-            ).await;
+                erasure_config,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -209,15 +216,19 @@ impl GrabNetwork {
     /// Announce that we're hosting a site
     pub async fn announce_site(&self, site_id: &SiteId, revision: u64) -> Result<()> {
         self.announced_sites.write().insert(*site_id, revision);
-        self.command_tx.send(SwarmCommand::Announce(*site_id, revision)).await?;
+        self.command_tx
+            .send(SwarmCommand::Announce(*site_id, revision))
+            .await?;
         Ok(())
     }
 
     /// Find hosts for a site via DHT
     pub async fn find_site(&self, site_id: &SiteId) -> Result<Vec<PeerRecord>> {
         let (tx, rx) = oneshot::channel();
-        self.command_tx.send(SwarmCommand::FindSite(*site_id, tx)).await?;
-        
+        self.command_tx
+            .send(SwarmCommand::FindSite(*site_id, tx))
+            .await?;
+
         match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(hosts)) => Ok(hosts),
             Ok(Err(_)) => Ok(vec![]),
@@ -228,7 +239,7 @@ impl GrabNetwork {
     /// Fetch a site from the network (manifest + all chunks)
     pub async fn fetch_site(&self, site_id: &SiteId) -> Result<Option<WebBundle>> {
         let hosts = self.find_site(site_id).await?;
-        
+
         if hosts.is_empty() {
             return Ok(None);
         }
@@ -237,11 +248,13 @@ impl GrabNetwork {
             if let Ok(peer_id) = host.peer_id.parse::<PeerId>() {
                 // First, get the manifest
                 let (tx, rx) = oneshot::channel();
-                self.command_tx.send(SwarmCommand::SendRequest(
-                    peer_id,
-                    GrabRequest::GetManifest { site_id: *site_id },
-                    tx,
-                )).await?;
+                self.command_tx
+                    .send(SwarmCommand::SendRequest(
+                        peer_id,
+                        GrabRequest::GetManifest { site_id: *site_id },
+                        tx,
+                    ))
+                    .await?;
 
                 if let Ok(Ok(GrabResponse::Manifest { bundle })) = rx.await {
                     // Collect all chunk IDs from the manifest
@@ -285,8 +298,11 @@ impl GrabNetwork {
                         }
                     }
 
-                    tracing::info!("Successfully fetched site {} with {} files", 
-                        site_id.to_base58(), bundle.manifest.files.len());
+                    tracing::info!(
+                        "Successfully fetched site {} with {} files",
+                        site_id.to_base58(),
+                        bundle.manifest.files.len()
+                    );
 
                     return Ok(Some(*bundle));
                 }
@@ -304,11 +320,15 @@ impl GrabNetwork {
         for host in hosts {
             if let Ok(peer_id) = host.peer_id.parse::<PeerId>() {
                 let (tx, rx) = oneshot::channel();
-                self.command_tx.send(SwarmCommand::SendRequest(
-                    peer_id,
-                    GrabRequest::PushUpdate { bundle: Box::new(bundle.clone()) },
-                    tx,
-                )).await?;
+                self.command_tx
+                    .send(SwarmCommand::SendRequest(
+                        peer_id,
+                        GrabRequest::PushUpdate {
+                            bundle: Box::new(bundle.clone()),
+                        },
+                        tx,
+                    ))
+                    .await?;
 
                 if let Ok(Ok(GrabResponse::Ack)) = rx.await {
                     updated += 1;
@@ -320,13 +340,21 @@ impl GrabNetwork {
     }
 
     /// Get chunks from a peer
-    pub async fn get_chunks(&self, peer_id: &PeerId, chunk_ids: &[ChunkId]) -> Result<Vec<(ChunkId, Vec<u8>)>> {
+    pub async fn get_chunks(
+        &self,
+        peer_id: &PeerId,
+        chunk_ids: &[ChunkId],
+    ) -> Result<Vec<(ChunkId, Vec<u8>)>> {
         let (tx, rx) = oneshot::channel();
-        self.command_tx.send(SwarmCommand::SendRequest(
-            *peer_id,
-            GrabRequest::GetChunks { chunk_ids: chunk_ids.to_vec() },
-            tx,
-        )).await?;
+        self.command_tx
+            .send(SwarmCommand::SendRequest(
+                *peer_id,
+                GrabRequest::GetChunks {
+                    chunk_ids: chunk_ids.to_vec(),
+                },
+                tx,
+            ))
+            .await?;
 
         match rx.await? {
             Ok(GrabResponse::Chunks { chunks }) => Ok(chunks),
@@ -344,9 +372,11 @@ async fn run_swarm(
     bootstrap_peers: Vec<String>,
     chunk_store: Arc<ChunkStore>,
     bundle_store: Arc<BundleStore>,
+    shard_store: Arc<ShardStore>,
     announced_sites: Arc<RwLock<HashMap<SiteId, u64>>>,
     connected_peers: Arc<RwLock<HashSet<PeerId>>>,
     event_tx: broadcast::Sender<NetworkEvent>,
+    erasure_config: Option<crate::erasure::ErasureConfig>,
 ) {
     // Start listening
     for addr in listen_addrs {
@@ -370,17 +400,30 @@ async fn run_swarm(
     }
 
     // Pending requests
-    let mut pending_requests: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<GrabResponse>>> = HashMap::new();
-    
+    let mut pending_requests: HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<Result<GrabResponse>>,
+    > = HashMap::new();
+
     // Pending replication requests (site_id -> requesting from peer)
-    let mut pending_replications: HashMap<request_response::OutboundRequestId, (SiteId, PeerId)> = HashMap::new();
-    
+    let mut pending_replications: HashMap<request_response::OutboundRequestId, (SiteId, PeerId)> =
+        HashMap::new();
+
     // Pending bundle replications - waiting for chunks (request_id -> bundle to save after chunks arrive)
-    let mut pending_bundle_replications: HashMap<request_response::OutboundRequestId, WebBundle> = HashMap::new();
-    
+    let mut pending_bundle_replications: HashMap<request_response::OutboundRequestId, WebBundle> =
+        HashMap::new();
+
+    // Pending shard replications - waiting for shards (request_id -> bundle to save after shards arrive)
+    let mut pending_shard_replications: HashMap<request_response::OutboundRequestId, WebBundle> =
+        HashMap::new();
+
+    // Check if erasure mode is enabled from config
+    let erasure_mode = erasure_config.is_some();
+
     // Pending DHT queries
-    let mut pending_site_queries: HashMap<QueryId, (SiteId, oneshot::Sender<Vec<PeerRecord>>)> = HashMap::new();
-    
+    let mut pending_site_queries: HashMap<QueryId, (SiteId, oneshot::Sender<Vec<PeerRecord>>)> =
+        HashMap::new();
+
     // Discovered providers for sites
     let mut site_providers: HashMap<SiteId, Vec<PeerRecord>> = HashMap::new();
 
@@ -402,16 +445,16 @@ async fn run_swarm(
                         swarm.behaviour_mut().kademlia.start_providing(key.clone())
                             .map_err(|e| tracing::warn!("Failed to start providing: {}", e))
                             .ok();
-                        
+
                         // Also put record with revision info
                         let value = bincode::serialize(&(swarm.local_peer_id().to_string(), revision)).unwrap_or_default();
                         let record = kad::Record::new(key, value);
                         let _ = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One);
-                        
+
                         // Broadcast via gossipsub
                         let msg = bincode::serialize(&(site_id, revision)).unwrap_or_default();
                         let _ = swarm.behaviour_mut().gossipsub.publish(sites_topic.clone(), msg);
-                        
+
                         tracing::info!("Announcing site {} revision {}", site_id.to_base58(), revision);
                     }
                     SwarmCommand::FindSite(site_id, tx) => {
@@ -455,13 +498,13 @@ async fn run_swarm(
                     SwarmEvent::NewListenAddr { address, .. } => {
                         tracing::info!("Listening on {}", address);
                     }
-                    
+
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         tracing::debug!("Connected to peer: {}", peer_id);
                         connected_peers.write().insert(peer_id);
                         let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
                     }
-                    
+
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         tracing::debug!("Disconnected from peer: {}", peer_id);
                         connected_peers.write().remove(&peer_id);
@@ -477,6 +520,7 @@ async fn run_swarm(
                                     request,
                                     &chunk_store,
                                     &bundle_store,
+                                    &shard_store,
                                     &announced_sites,
                                     swarm.local_peer_id(),
                                 ).await;
@@ -492,7 +536,7 @@ async fn run_swarm(
                                             "Received manifest for replication: {} rev {}",
                                             site_id.to_base58(), bundle.revision
                                         );
-                                        
+
                                         // Collect all chunk IDs
                                         let mut all_chunks: Vec<ChunkId> = Vec::new();
                                         for file in &bundle.manifest.files {
@@ -502,15 +546,41 @@ async fn run_swarm(
                                                 }
                                             }
                                         }
-                                        
-                                        // Request chunks in a single batch (or could be multiple)
+
                                         if !all_chunks.is_empty() {
-                                            let chunk_request_id = swarm.behaviour_mut().request_response.send_request(
-                                                &peer_id,
-                                                GrabRequest::GetChunks { chunk_ids: all_chunks },
-                                            );
-                                            // Store bundle for when chunks arrive
-                                            pending_bundle_replications.insert(chunk_request_id, *bundle);
+                                            if erasure_mode {
+                                                // In erasure mode, request specific shards instead of full chunks.
+                                                // Request 1 shard per chunk to participate in distributed storage.
+                                                let shard_requests: Vec<(ChunkId, Vec<u8>)> = all_chunks
+                                                    .iter()
+                                                    .map(|cid| {
+                                                        // Request shard indices we don't already have
+                                                        let local = shard_store.local_shard_indices(cid);
+                                                        // Request up to 2 shards per chunk that we're missing
+                                                        let mut wanted: Vec<u8> = (0..6u8)
+                                                            .filter(|i| !local.contains(i))
+                                                            .take(2)
+                                                            .collect();
+                                                        if wanted.is_empty() {
+                                                            wanted = vec![0]; // Fallback
+                                                        }
+                                                        (*cid, wanted)
+                                                    })
+                                                    .collect();
+
+                                                let shard_request_id = swarm.behaviour_mut().request_response.send_request(
+                                                    &peer_id,
+                                                    GrabRequest::GetShards { requests: shard_requests },
+                                                );
+                                                pending_shard_replications.insert(shard_request_id, *bundle);
+                                            } else {
+                                                // Full chunk replication mode
+                                                let chunk_request_id = swarm.behaviour_mut().request_response.send_request(
+                                                    &peer_id,
+                                                    GrabRequest::GetChunks { chunk_ids: all_chunks },
+                                                );
+                                                pending_bundle_replications.insert(chunk_request_id, *bundle);
+                                            }
                                         } else {
                                             // No chunks needed, just save the bundle
                                             if let Err(e) = bundle_store.save_hosted_site(&bundle) {
@@ -527,7 +597,7 @@ async fn run_swarm(
                                             "Received {} chunks for replication of {}",
                                             chunks.len(), bundle.site_id.to_base58()
                                         );
-                                        
+
                                         // Store all chunks
                                         for (expected_id, data) in chunks {
                                             match chunk_store.put(&data) {
@@ -543,7 +613,7 @@ async fn run_swarm(
                                                 }
                                             }
                                         }
-                                        
+
                                         // Save the bundle
                                         if let Err(e) = bundle_store.save_hosted_site(&bundle) {
                                             tracing::warn!("Failed to save replicated bundle: {}", e);
@@ -554,11 +624,55 @@ async fn run_swarm(
                                             );
                                         }
                                     }
+                                } else if let Some(bundle) = pending_shard_replications.remove(&request_id) {
+                                    // Handle erasure-coded shard replication response
+                                    if let GrabResponse::Shards { shards } = response {
+                                        tracing::info!(
+                                            "Received {} shards for erasure replication of {}",
+                                            shards.len(), bundle.site_id.to_base58()
+                                        );
+
+                                        let mut stored = 0usize;
+                                        for (chunk_id, shard_index, data) in shards {
+                                            // Look up erasure config from any shard metadata we already have,
+                                            // or fall back to the config default
+                                            let erasure_cfg = erasure_config.unwrap_or_default();
+                                            let shard_hash = crate::crypto::hash(&data);
+                                            let shard = crate::erasure::Shard {
+                                                id: crate::erasure::ShardId {
+                                                    chunk_id,
+                                                    shard_index,
+                                                },
+                                                data,
+                                                shard_hash,
+                                                is_parity: (shard_index as usize) >= erasure_cfg.data_shards,
+                                                original_chunk_size: 0, // Will be filled by reconstruction
+                                                erasure_config: erasure_cfg,
+                                            };
+                                            if let Err(e) = shard_store.put(&shard) {
+                                                tracing::warn!("Failed to store replicated shard: {}", e);
+                                            } else {
+                                                stored += 1;
+                                            }
+                                        }
+
+                                        tracing::info!("Stored {} shards for site {}", stored, bundle.site_id.to_base58());
+
+                                        // Save the bundle (manifest) so we know what chunks are needed
+                                        if let Err(e) = bundle_store.save_hosted_site(&bundle) {
+                                            tracing::warn!("Failed to save replicated bundle: {}", e);
+                                        } else {
+                                            tracing::info!(
+                                                "Successfully replicated site {} rev {} (erasure mode)",
+                                                bundle.site_id.to_base58(), bundle.revision
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    
+
                     SwarmEvent::Behaviour(GrabBehaviourEvent::RequestResponse(
                         request_response::Event::OutboundFailure { request_id, error, .. }
                     )) => {
@@ -566,7 +680,7 @@ async fn run_swarm(
                             let _ = tx.send(Err(anyhow!("Request failed: {:?}", error)));
                         }
                     }
-                    
+
                     SwarmEvent::Behaviour(GrabBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed { id, result, .. })) => {
                         match result {
                             QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })) => {
@@ -605,20 +719,20 @@ async fn run_swarm(
                             let result: Result<(SiteId, u64), _> = bincode::deserialize(&message.data);
                             if let Ok((site_id, revision)) = result {
                                 tracing::debug!("Received site announcement: {} rev {}", site_id.to_base58(), revision);
-                                
+
                                 // Check if we're hosting this site and need to update
                                 let should_replicate = if let Ok(Some(hosted)) = bundle_store.get_bundle(&site_id) {
                                     hosted.revision < revision
                                 } else {
                                     false
                                 };
-                                
+
                                 if should_replicate {
                                     tracing::info!(
                                         "Auto-replicating site {} from peer {} (new revision {})",
                                         site_id.to_base58(), propagation_source, revision
                                     );
-                                    
+
                                     // Request manifest from the announcing peer
                                     let request_id = swarm.behaviour_mut().request_response.send_request(
                                         &propagation_source,
@@ -626,7 +740,7 @@ async fn run_swarm(
                                     );
                                     pending_replications.insert(request_id, (site_id, propagation_source));
                                 }
-                                
+
                                 let _ = event_tx.send(NetworkEvent::SiteAnnounced {
                                     site_id,
                                     peer_id: propagation_source,
@@ -648,7 +762,7 @@ async fn run_swarm(
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                         }
                     }
-                    
+
                     SwarmEvent::Behaviour(GrabBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                         for (peer_id, _) in peers {
                             tracing::debug!("Peer expired: {}", peer_id);
@@ -674,6 +788,7 @@ async fn handle_request(
     request: GrabRequest,
     chunk_store: &ChunkStore,
     bundle_store: &BundleStore,
+    shard_store: &ShardStore,
     announced_sites: &RwLock<HashMap<SiteId, u64>>,
     local_peer_id: &PeerId,
 ) -> GrabResponse {
@@ -691,13 +806,17 @@ async fn handle_request(
                 GrabResponse::SiteHosts { hosts: vec![] }
             }
         }
-        GrabRequest::GetManifest { site_id } => {
-            match bundle_store.get_bundle(&site_id) {
-                Ok(Some(bundle)) => GrabResponse::Manifest { bundle: Box::new(bundle) },
-                Ok(None) => GrabResponse::Error { message: "Site not found".to_string() },
-                Err(e) => GrabResponse::Error { message: e.to_string() },
-            }
-        }
+        GrabRequest::GetManifest { site_id } => match bundle_store.get_bundle(&site_id) {
+            Ok(Some(bundle)) => GrabResponse::Manifest {
+                bundle: Box::new(bundle),
+            },
+            Ok(None) => GrabResponse::Error {
+                message: "Site not found".to_string(),
+            },
+            Err(e) => GrabResponse::Error {
+                message: e.to_string(),
+            },
+        },
         GrabRequest::GetChunks { chunk_ids } => {
             let mut chunks = Vec::new();
             for chunk_id in chunk_ids {
@@ -708,15 +827,50 @@ async fn handle_request(
             GrabResponse::Chunks { chunks }
         }
         GrabRequest::Announce { site_id, revision } => {
-            tracing::info!("Peer announced site {} revision {}", site_id.to_base58(), revision);
+            tracing::info!(
+                "Peer announced site {} revision {}",
+                site_id.to_base58(),
+                revision
+            );
             GrabResponse::Ack
         }
         GrabRequest::PushUpdate { bundle } => {
             if let Err(e) = bundle_store.save_bundle(&bundle) {
-                return GrabResponse::Error { message: e.to_string() };
+                return GrabResponse::Error {
+                    message: e.to_string(),
+                };
             }
-            tracing::info!("Received update for {} revision {}", bundle.name, bundle.revision);
+            tracing::info!(
+                "Received update for {} revision {}",
+                bundle.name,
+                bundle.revision
+            );
             GrabResponse::Ack
+        }
+        GrabRequest::GetShards { requests } => {
+            let mut shards = Vec::new();
+            for (chunk_id, indices) in requests {
+                for idx in indices {
+                    let shard_id = crate::erasure::ShardId {
+                        chunk_id,
+                        shard_index: idx,
+                    };
+                    if let Ok(Some(data)) = shard_store.get(&shard_id) {
+                        shards.push((chunk_id, idx, data));
+                    }
+                }
+            }
+            GrabResponse::Shards { shards }
+        }
+        GrabRequest::QueryShards { chunk_ids } => {
+            let mut availability = Vec::new();
+            for chunk_id in chunk_ids {
+                let indices = shard_store.local_shard_indices(&chunk_id);
+                if !indices.is_empty() {
+                    availability.push((chunk_id, indices));
+                }
+            }
+            GrabResponse::ShardMap { availability }
         }
     }
 }

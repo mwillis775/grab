@@ -192,6 +192,56 @@ pub struct GatewayConfig {
     /// Enable CORS
     #[serde(default = "default_true")]
     pub cors: bool,
+    /// Optional TLS configuration. When set, the gateway serves HTTPS.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS configuration for the gateway.
+///
+/// Paths point to PEM-encoded certificate and private key files. When `https_port`
+/// is set, the gateway listens on that port for HTTPS in addition to the plain
+/// `port` (which serves a permanent redirect to the HTTPS origin). When `https_port`
+/// is `None`, the gateway listens for HTTPS on `gateway.port` directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Path to PEM-encoded certificate (full chain)
+    pub cert_path: std::path::PathBuf,
+    /// Path to PEM-encoded private key
+    pub key_path: std::path::PathBuf,
+    /// Optional dedicated HTTPS port. If `None`, HTTPS uses `gateway.port`.
+    #[serde(default)]
+    pub https_port: Option<u16>,
+}
+
+/// Runtime options for starting the gateway.
+#[derive(Debug, Clone)]
+pub struct GatewayOptions {
+    /// Port to bind for plain HTTP (or HTTPS if `tls.https_port` is `None`).
+    pub port: u16,
+    /// Optional default site to serve at `/` when no host alias matches.
+    pub default_site: Option<SiteId>,
+    /// Optional TLS configuration; when set, the gateway serves HTTPS.
+    pub tls: Option<TlsConfig>,
+    /// Static `Host` header → site id mapping. Each `(host, site_id)` pair
+    /// causes requests with that `Host:` to be served as if the site were the
+    /// default at root.
+    pub aliases: Vec<(String, SiteId)>,
+    /// When `true`, hosts not present in `aliases` and without a configured
+    /// default fall through to a `_grab.<host>` TXT lookup.
+    pub dns_aliases: bool,
+}
+
+impl Default for GatewayOptions {
+    fn default() -> Self {
+        Self {
+            port: 8080,
+            default_site: None,
+            tls: None,
+            aliases: Vec::new(),
+            dns_aliases: false,
+        }
+    }
 }
 
 fn default_gateway_port() -> u16 {
@@ -214,6 +264,9 @@ pub struct StorageConfig {
     /// Maximum storage in GB (0 = unlimited)
     #[serde(default)]
     pub max_storage_gb: usize,
+    /// Erasure coding config for distributed storage (None = full replication)
+    #[serde(default)]
+    pub erasure: Option<crate::erasure::ErasureConfig>,
 }
 
 fn default_cache_size() -> usize {
@@ -247,10 +300,12 @@ impl Default for Config {
                 port: default_gateway_port(),
                 host: default_gateway_host(),
                 cors: true,
+                tls: None,
             },
             storage: StorageConfig {
                 cache_size_mb: default_cache_size(),
                 max_storage_gb: 0,
+                erasure: None,
             },
             publisher: PublisherConfig {
                 chunk_size: default_chunk_size(),
@@ -264,7 +319,7 @@ impl Config {
     /// Load config from data directory or create default
     pub fn load_or_default(data_dir: &std::path::Path) -> anyhow::Result<Self> {
         let config_path = data_dir.join("config.json");
-        
+
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             Ok(serde_json::from_str(&contents)?)
@@ -275,7 +330,7 @@ impl Config {
             Ok(config)
         }
     }
-    
+
     /// Save config to data directory
     pub fn save(&self, data_dir: &std::path::Path) -> anyhow::Result<()> {
         let config_path = data_dir.join("config.json");
@@ -298,6 +353,13 @@ pub enum GrabRequest {
     Announce { site_id: SiteId, revision: u64 },
     /// Push an update to hosts
     PushUpdate { bundle: Box<WebBundle> },
+    /// Get erasure-coded shards for specific chunks
+    GetShards {
+        /// List of (chunk_id, shard_indices) to fetch
+        requests: Vec<(ChunkId, Vec<u8>)>,
+    },
+    /// Query which shards a peer holds for given chunks
+    QueryShards { chunk_ids: Vec<ChunkId> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +374,15 @@ pub enum GrabResponse {
     Ack,
     /// Error
     Error { message: String },
+    /// Erasure-coded shards
+    Shards {
+        /// Vec of (chunk_id, shard_index, shard_data)
+        shards: Vec<(ChunkId, u8, Vec<u8>)>,
+    },
+    /// Shard availability map: (chunk_id, list of shard indices held)
+    ShardMap {
+        availability: Vec<(ChunkId, Vec<u8>)>,
+    },
 }
 
 /// Information about a peer hosting a site

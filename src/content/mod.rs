@@ -2,4 +2,4 @@
 
 mod uploads;
 
-pub use uploads::{UserContentManager, UploadPolicy, UserUpload, UploadStatus};
+pub use uploads::{UploadPolicy, UploadStatus, UserContentManager, UserUpload};

@@ -28,12 +28,14 @@ pub struct GrabBehaviour {
 
 impl GrabBehaviour {
     /// Create a new GrabNet behaviour
-    pub fn new(local_peer_id: libp2p::PeerId, local_public_key: libp2p::identity::PublicKey) -> Self {
+    pub fn new(
+        local_peer_id: libp2p::PeerId,
+        local_public_key: libp2p::identity::PublicKey,
+    ) -> Self {
         // Request/response config
         let request_response = request_response::Behaviour::new(
             [(PROTOCOL_NAME, ProtocolSupport::Full)],
-            request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(60)),
+            request_response::Config::default().with_request_timeout(Duration::from_secs(60)),
         );
 
         // Kademlia config
@@ -49,18 +51,13 @@ impl GrabBehaviour {
             .expect("Valid gossipsub config");
 
         // Use anonymous message authenticity for now (simpler)
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Anonymous,
-            gossipsub_config,
-        )
-        .expect("Valid gossipsub behaviour");
+        let gossipsub =
+            gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
+                .expect("Valid gossipsub behaviour");
 
         // mDNS for local discovery
-        let mdns = mdns::tokio::Behaviour::new(
-            mdns::Config::default(),
-            local_peer_id,
-        )
-        .expect("Valid mDNS behaviour");
+        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+            .expect("Valid mDNS behaviour");
 
         // Identify protocol
         let identify = identify::Behaviour::new(identify::Config::new(

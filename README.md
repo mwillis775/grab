@@ -48,11 +48,23 @@ GrabNet is a peer-to-peer protocol for publishing and hosting websites on a dece
 | Address stability | ✅ Fixed | ❌ Changes on update | ✅ Stable forever |
 | Name resolution | ✅ Fast DNS | ❌ IPNS is slow | ✅ <100ms via DHT |
 | Update efficiency | ✅ Incremental | ❌ Full re-upload | ✅ Delta sync |
+| **Storage efficiency** | ❌ N copies of every byte | ⚠️ Per-CID dedup only | ✅ **Global chunk dedup + erasure coding** |
+| **Per-node burden as network grows** | ❌ Grows linearly | ❌ Full pin per host | ✅ **Shrinks: shards spread across peers** |
 | Censorship resistance | ❌ Single server | ✅ Distributed | ✅ Distributed |
 | Native HTTP serving | ✅ Yes | ❌ Needs gateway | ✅ Built-in |
 | User-generated content | ✅ Yes | ❌ Complex | ✅ Built-in |
 | Cost | ❌ Ongoing | ✅ Free (if pinned) | ✅ Free |
 | Setup complexity | ❌ Complex | ❌ Complex | ✅ Single binary |
+
+### The Core Promise: Hosting That Gets *Cheaper* As The Network Grows
+
+Most decentralized systems get more expensive per node as you host more sites — every host stores a full copy of everything they pin. GrabNet is built the opposite way:
+
+- **Global content-addressed dedup.** Every chunk is keyed by `BLAKE3(data)` in a single per-node `~/.grab/chunks` store. If two files in the same site, two revisions of the same site, or two completely unrelated sites share a chunk (a logo, a font, a JS library, an HTML boilerplate, an unchanged asset between revisions), it is **stored exactly once on disk**. Re-publishing a site after a small edit only adds the new chunks; archival history is preserved without paying for it twice.
+- **Erasure-coded sharding (`--erasure 4+2`).** Instead of every host storing the full site, a chunk is split into `data + parity` Reed-Solomon shards (default 4+2 = 6). Each peer stores only 1–2 shards. Any 4 of 6 reconstruct the original. **Network-wide storage cost is 1.5× the site size instead of N×**, and per-node cost trends toward zero as more peers join — while loss tolerance stays at 33% of replicas.
+- **Archival is never sacrificed.** Old revisions, unreferenced chunks, and pinned historical bundles are kept; dedup means archival storage is effectively free at the chunk level. Garbage collection is opt-in, never automatic.
+
+This is the property that makes GrabNet viable in practice: **adding nodes makes the network lighter, not heavier**.
 
 ---
 
@@ -71,6 +83,10 @@ Sites currently hosted on GrabNet:
 ## Features
 
 ### Core Features
+
+- **♻️ Native Chunk Deduplication** - All content is content-addressed by `BLAKE3(data)` in a single per-node chunk store. Identical chunks across files, revisions, and *unrelated sites* are stored exactly once. Archival history costs nothing extra.
+
+- **🧮 Erasure-Coded Sharding** - Optional Reed-Solomon `--erasure data+parity` (e.g. `4+2`) splits each chunk into shards distributed across peers. Network cost stays ~1.5× the site size instead of N×, and per-node burden drops as more peers join. Any 4 of 6 shards reconstruct the chunk.
 
 - **🔒 Stable Addresses** - Your site ID is `blake3(publisher_key || site_name)`. It never changes, even after thousands of updates.
 
@@ -293,6 +309,33 @@ grab gateway --port 3000
 # The gateway serves all your published and hosted sites
 ```
 
+#### HTTPS / TLS
+
+The gateway can terminate TLS directly with rustls — no reverse proxy required.
+
+```bash
+# Plain HTTPS on port 8443
+grab gateway \
+  --port 8443 \
+  --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/example.com/privkey.pem
+
+# Standard HTTPS on 443 with an HTTP -> HTTPS redirect on 80
+sudo grab gateway \
+  --port 80 \
+  --https-port 443 \
+  --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/example.com/privkey.pem \
+  --default-site rootedrevival
+```
+
+When `--https-port` is supplied, `--port` becomes a permanent-redirect listener
+(308) to the HTTPS origin. When it is omitted, the gateway listens for HTTPS
+directly on `--port` and no plaintext listener is opened.
+
+Certs are PEM-encoded; `fullchain.pem` from Let's Encrypt / certbot works as-is.
+Cert/key reload requires a gateway restart.
+
 **Gateway Endpoints:**
 
 | Endpoint | Description |
@@ -303,6 +346,66 @@ grab gateway --port 3000
 | `GET /api/sites/:id/manifest` | Get site manifest |
 | `GET /site/:id/` | Serve site index |
 | `GET /site/:id/*path` | Serve site files |
+| `GET /ens/:name[/path]` | Resolve `<name>.eth` and 302-redirect to `/site/<id>/...` |
+| `GET /` (with `Host:`) | Serve the site mapped to `Host:` via `--alias` or `--dns-aliases` |
+
+#### Host-based routing — `--alias` and `--dns-aliases`
+
+The gateway can serve different sites for different hostnames out of a single
+process, the same way a traditional HTTP server uses virtual hosts.
+
+```bash
+# Static aliases (repeatable). Site reference is a local site name OR a base58 site id.
+grab gateway --port 8080 \
+  --alias rootedrevival.us=rootedrevival \
+  --alias myblog.example=DGu4...8nF
+
+# Dynamic aliases via DNS. For any host not in --alias, the gateway looks up
+# `_grab.<host>` TXT records and caches results for the record's TTL.
+grab gateway --port 8080 --dns-aliases
+```
+
+Publish a TXT record like this to make a domain resolve to a site:
+
+```
+_grab.example.com.   IN  TXT  "grab-site=DGu4VfkP6JwT1QmK2x9LzN8nF..."
+```
+
+Helpers:
+
+```bash
+grab dns record rootedrevival      # print the TXT record to publish
+grab dns resolve rootedrevival.us  # query DNS and print the resolved site id
+```
+
+#### ENS resolution
+
+```bash
+# CLI
+grab ens resolve rootedrevival.eth
+grab ens resolve rootedrevival.eth --gateway https://your-ens-gw/text/{name}/grab-site
+
+# HTTP — gateway-side redirect to /site/<resolved>/...
+curl -I http://127.0.0.1:8080/ens/rootedrevival.eth/
+```
+
+The default gateway is the public `api.ensideas.com` resolver; override with
+`--gateway` (CLI) or by running your own ENS HTTP gateway. Set the ENS text
+record `grab-site` to the base58 site id you want to resolve to.
+
+#### CDN / edge caching
+
+Because every chunk is content-addressed, gateway responses are
+trivially cacheable:
+
+- Strong **`ETag: "<full-blake3-hash>"`** on every file response
+- **`Cache-Control: public, max-age=31536000, immutable`** for static assets
+  (HTML uses `public, max-age=0, must-revalidate` so site updates are visible)
+- **`Vary: Accept-Encoding`** + on-the-wire gzip
+- Tolerant `If-None-Match` parsing → cheap `304 Not Modified` responses
+
+Stick any HTTP cache (Cloudflare, Varnish, Nginx, an edge worker) in front of
+a `grab gateway` and it Just Works.
 
 ### Network Commands
 
@@ -915,12 +1018,13 @@ grab/
 
 ## Roadmap
 
-- [ ] **Browser Extension** - Resolve `grab://` URLs in the browser
-- [ ] **HTTPS/TLS Support** - Built-in TLS termination
-- [ ] **ENS Integration** - Map ENS names to site IDs
-- [ ] **DNS Integration** - TXT record based resolution
+- [x] **HTTPS/TLS Support** - Built-in TLS termination via rustls (`--tls-cert` / `--tls-key` / `--https-port`)
+- [x] **DNS Integration** - `_grab.<host>` TXT record resolution with TTL-respecting cache (`--dns-aliases`, `grab dns resolve`, `grab dns record`)
+- [x] **Static Host Aliases** - Map any `Host:` header to a site at gateway start (`--alias host=site`, repeatable)
+- [x] **CDN / Edge Caching** - Strong BLAKE3 ETags, `Cache-Control: immutable` for content-addressed assets, `Vary: Accept-Encoding`, gzip on the wire
+- [x] **ENS Integration** - Resolve `*.eth` site ids via a configurable HTTPS gateway (`grab ens resolve`, `/ens/<name>` route)
+- [x] **Browser Extension** - MV3 omnibox keyword + in-page `grab://` link rewriter ([`extension/grabnet-resolver`](extension/grabnet-resolver))
 - [ ] **Economic Incentives** - Token-based hosting rewards
-- [ ] **CDN Integration** - Edge caching for popular sites
 - [ ] **WASM Browser Nodes** - Run nodes directly in browsers
 - [ ] **Mobile Apps** - iOS/Android gateway apps
 

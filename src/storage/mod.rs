@@ -1,9 +1,9 @@
 //! Storage layer for GrabNet
 
-mod chunks;
 mod bundles;
+mod chunks;
 mod keys;
 
-pub use chunks::ChunkStore;
 pub use bundles::BundleStore;
+pub use chunks::ChunkStore;
 pub use keys::KeyStore;

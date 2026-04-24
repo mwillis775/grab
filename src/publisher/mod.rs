@@ -2,4 +2,4 @@
 
 mod bundle;
 
-pub use bundle::{Publisher, PublishOptions, PublishResult};
+pub use bundle::{PublishOptions, PublishResult, Publisher};

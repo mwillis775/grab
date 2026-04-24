@@ -1,11 +1,11 @@
 //! Bundle and site metadata storage using sled
 
+use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::{Result, anyhow};
 
-use crate::types::{SiteId, WebBundle, PublishedSite, HostedSite, SiteManifest};
 use crate::crypto::{encode_base58, SiteIdExt};
+use crate::types::{HostedSite, PublishedSite, SiteId, SiteManifest, WebBundle};
 
 /// Site metadata store backed by sled
 pub struct BundleStore {
@@ -28,7 +28,7 @@ impl BundleStore {
     pub fn new(data_dir: &Path) -> Result<Self> {
         let db_path = data_dir.join("sites.db");
         let db = sled::open(&db_path)?;
-        
+
         Ok(Self {
             published: db.open_tree("published")?,
             hosted: db.open_tree("hosted")?,
@@ -48,10 +48,10 @@ impl BundleStore {
         let key = &site.site_id;
         let value = bincode::serialize(site)?;
         self.published.insert(key, value)?;
-        
+
         // Index by name
         self.names.insert(site.name.as_bytes(), key)?;
-        
+
         Ok(())
     }
 
@@ -63,14 +63,14 @@ impl BundleStore {
                 return Ok(Some(bincode::deserialize(&data)?));
             }
         }
-        
+
         // Try as name
         if let Some(site_id) = self.names.get(id_or_name.as_bytes())? {
             if let Some(data) = self.published.get(&*site_id)? {
                 return Ok(Some(bincode::deserialize(&data)?));
             }
         }
-        
+
         Ok(None)
     }
 
@@ -117,10 +117,10 @@ impl BundleStore {
 
         let value = bincode::serialize(&site)?;
         self.hosted.insert(&bundle.site_id, value)?;
-        
+
         // Also save the bundle
         self.save_bundle(bundle)?;
-        
+
         Ok(())
     }
 
@@ -170,22 +170,22 @@ impl BundleStore {
         let value = bincode::serialize(bundle)?;
         tracing::debug!("Saving bundle: {} bytes", value.len());
         self.bundles.insert(&bundle.site_id, value)?;
-        
+
         // Save manifest separately for quick access
         let manifest = bincode::serialize(&bundle.manifest)?;
         tracing::debug!("Saving manifest: {} bytes", manifest.len());
         self.manifests.insert(&bundle.site_id, manifest)?;
-        
+
         // Ensure data is flushed to disk
         self.flush()?;
-        
+
         // Verify saved correctly
         if let Some(saved) = self.manifests.get(&bundle.site_id)? {
             tracing::debug!("Verified manifest saved: {} bytes", saved.len());
         } else {
             tracing::error!("Manifest not found after save!");
         }
-        
+
         Ok(())
     }
 
@@ -218,14 +218,14 @@ impl BundleStore {
         if let Some(site_id) = SiteId::from_base58(id_or_name) {
             return Ok(Some(site_id));
         }
-        
+
         // Try as name
         if let Some(site_id_bytes) = self.names.get(id_or_name.as_bytes())? {
             let mut site_id = [0u8; 32];
             site_id.copy_from_slice(&site_id_bytes);
             return Ok(Some(site_id));
         }
-        
+
         Ok(None)
     }
 
@@ -243,8 +243,8 @@ impl BundleStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     fn create_test_bundle() -> WebBundle {
         WebBundle {
@@ -268,7 +268,7 @@ mod tests {
     fn test_published_sites() -> Result<()> {
         let dir = tempdir()?;
         let store = BundleStore::new(dir.path())?;
-        
+
         let site = PublishedSite {
             site_id: [1u8; 32],
             name: "my-site".to_string(),
@@ -277,22 +277,22 @@ mod tests {
             created_at: 123,
             updated_at: 456,
         };
-        
+
         store.save_published_site(&site)?;
-        
+
         // Get by ID
         let site_id_b58 = site.site_id.to_base58();
         let retrieved = store.get_published_site(&site_id_b58)?.unwrap();
         assert_eq!(retrieved.name, "my-site");
-        
+
         // Get by name
         let by_name = store.get_published_site("my-site")?.unwrap();
         assert_eq!(by_name.site_id, site.site_id);
-        
+
         // List all
         let all = store.get_all_published_sites()?;
         assert_eq!(all.len(), 1);
-        
+
         Ok(())
     }
 
@@ -300,14 +300,14 @@ mod tests {
     fn test_hosted_sites() -> Result<()> {
         let dir = tempdir()?;
         let store = BundleStore::new(dir.path())?;
-        
+
         let bundle = create_test_bundle();
         store.save_hosted_site(&bundle)?;
-        
+
         let hosted = store.get_hosted_site(&bundle.site_id)?.unwrap();
         assert_eq!(hosted.name, "test-site");
         assert_eq!(hosted.revision, 1);
-        
+
         Ok(())
     }
 }

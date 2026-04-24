@@ -1,11 +1,11 @@
 //! GrabNet CLI
 
-use std::path::PathBuf;
-use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use grabnet::{Grab, PublishOptions, SiteIdExt};
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
+use std::path::PathBuf;
+use std::time::Duration;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
@@ -97,7 +97,7 @@ enum Commands {
     Pin {
         /// Site ID to pin
         site_id: String,
-        
+
         /// Peer address to connect to
         #[arg(short, long)]
         peer: Option<String>,
@@ -117,13 +117,47 @@ enum Commands {
 
     /// Start the HTTP gateway
     Gateway {
-        /// Port to listen on
+        /// Port to listen on (HTTP, or HTTPS if --tls-cert is set without --https-port)
         #[arg(short, long, default_value = "8080")]
         port: u16,
 
         /// Default site to serve at root (name or ID)
         #[arg(long)]
         default_site: Option<String>,
+
+        /// Path to PEM-encoded TLS certificate (full chain). Enables HTTPS.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<std::path::PathBuf>,
+
+        /// Path to PEM-encoded TLS private key.
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<std::path::PathBuf>,
+
+        /// Dedicated HTTPS port. When set with --tls-cert, --port serves an HTTP→HTTPS redirect.
+        #[arg(long, requires = "tls_cert")]
+        https_port: Option<u16>,
+
+        /// Static `Host` → site mapping, e.g. `--alias rootedrevival.us=rootedrevival`
+        /// or `--alias example.org=<base58-site-id>`. May be repeated.
+        #[arg(long = "alias", value_name = "HOST=SITE")]
+        aliases: Vec<String>,
+
+        /// Resolve unknown hosts via `_grab.<host>` DNS TXT records.
+        /// Successful lookups are cached for the record's TTL.
+        #[arg(long)]
+        dns_aliases: bool,
+    },
+
+    /// DNS-based site discovery
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
+    },
+
+    /// ENS (Ethereum Name Service) site discovery
+    Ens {
+        #[command(subcommand)]
+        action: EnsAction,
     },
 
     /// Bootstrap node management
@@ -147,7 +181,7 @@ enum NodeAction {
         /// Run in light mode (no hosting)
         #[arg(long)]
         light: bool,
-        
+
         /// Bootstrap peers to connect to
         #[arg(short, long)]
         bootstrap: Vec<String>,
@@ -205,7 +239,7 @@ enum BootstrapAction {
     Add {
         /// Node name
         name: String,
-        
+
         /// Multiaddress (e.g., /ip4/1.2.3.4/tcp/4001)
         address: String,
     },
@@ -218,6 +252,35 @@ enum BootstrapAction {
 
     /// Test connectivity to bootstrap nodes
     Test,
+}
+
+#[derive(Subcommand)]
+enum DnsAction {
+    /// Resolve a domain via `_grab.<host>` TXT record.
+    Resolve {
+        /// Hostname (e.g. `rootedrevival.us`)
+        host: String,
+    },
+
+    /// Print the TXT record value to publish for a given site.
+    Record {
+        /// Site name or base58 site id
+        site: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnsAction {
+    /// Resolve an ENS name (`*.eth`) to a site id via the configured gateway.
+    Resolve {
+        /// ENS name (e.g. `rootedrevival.eth`)
+        name: String,
+
+        /// Override the ENS gateway URL template.
+        /// `{name}` is replaced with the lowercased ENS name.
+        #[arg(long)]
+        gateway: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -276,30 +339,39 @@ async fn main() -> Result<()> {
             let result = grab.publish(&path, options.clone()).await?;
 
             println!();
-            println!("✓ Bundled {} files ({} bytes)", result.file_count, result.total_size);
+            println!(
+                "✓ Bundled {} files ({} bytes)",
+                result.file_count, result.total_size
+            );
             if result.compressed_size < result.total_size {
                 let savings = 100 - (result.compressed_size * 100 / result.total_size);
-                println!("✓ Compressed to {} bytes ({}% smaller)", result.compressed_size, savings);
+                println!(
+                    "✓ Compressed to {} bytes ({}% smaller)",
+                    result.compressed_size, savings
+                );
             }
-            println!("✓ {} chunks ({} new)", result.chunk_count, result.new_chunks);
+            println!(
+                "✓ {} chunks ({} new)",
+                result.chunk_count, result.new_chunks
+            );
             println!();
             println!("🌐 Site ID:  grab://{}", result.bundle.site_id.to_base58());
             println!("📝 Name:     {}", result.bundle.name);
             println!("🔄 Revision: {}", result.bundle.revision);
-            
+
             // Run post-deploy hook if specified
             if let Some(ref hook) = post_hook {
                 println!();
                 println!("🔧 Running post-deploy hook...");
                 run_hook(hook, &path)?;
             }
-            
+
             println!();
-            
+
             if watch {
                 println!("👀 Watching for changes... (Ctrl+C to stop)");
                 println!();
-                
+
                 run_watch_mode(&grab, &path, options).await?;
             } else {
                 println!("Start gateway to serve: grab gateway");
@@ -313,7 +385,10 @@ async fn main() -> Result<()> {
                 Some(result) => {
                     println!();
                     println!("✓ Updated to revision {}", result.bundle.revision);
-                    println!("✓ {} files, {} chunks", result.file_count, result.chunk_count);
+                    println!(
+                        "✓ {} files, {} chunks",
+                        result.file_count, result.chunk_count
+                    );
                 }
                 None => {
                     println!("❌ Site not found: {}", site);
@@ -379,17 +454,21 @@ async fn main() -> Result<()> {
 
         Commands::Node { action } => {
             match action {
-                NodeAction::Start { port: _, light: _, bootstrap } => {
+                NodeAction::Start {
+                    port: _,
+                    light: _,
+                    bootstrap,
+                } => {
                     println!("🌐 Starting GrabNet node...");
                     grab.start_network().await?;
-                    
+
                     let status = grab.network_status();
                     println!();
                     println!("✓ Node started");
                     if let Some(peer_id) = &status.peer_id {
                         println!("  Peer ID: {}", peer_id);
                     }
-                    
+
                     // Connect to additional bootstrap peers
                     if !bootstrap.is_empty() {
                         for addr in bootstrap {
@@ -404,7 +483,7 @@ async fn main() -> Result<()> {
                     println!();
                     println!("Press Ctrl+C to stop");
                     println!();
-                    
+
                     // Subscribe to events
                     if let Some(mut rx) = grab.subscribe_network() {
                         loop {
@@ -467,7 +546,7 @@ async fn main() -> Result<()> {
 
                     println!("🔗 Connected Peers: {}", status.peers);
                     println!();
-                    
+
                     // Get detailed peer list
                     if let Some(guard) = grab.network() {
                         if let Some(network) = guard.as_ref() {
@@ -488,7 +567,7 @@ async fn main() -> Result<()> {
                 NodeAction::Connect { address } => {
                     // Start network if not running
                     grab.start_network().await?;
-                    
+
                     println!("Connecting to {}...", address);
                     grab.dial_peer(&address).await?;
                     println!("✓ Connection initiated");
@@ -523,7 +602,7 @@ async fn main() -> Result<()> {
             // Start network
             println!("  Starting P2P network...");
             grab.start_network().await?;
-            
+
             // Give it a moment to initialize
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -537,7 +616,7 @@ async fn main() -> Result<()> {
             // Try to fetch and host
             if grab.host(&id).await? {
                 println!("✓ Site pinned successfully!");
-                
+
                 // Show info
                 if let Ok(Some(bundle)) = grab.bundle_store().get_bundle(&id) {
                     println!("  Name:     {}", bundle.name);
@@ -546,7 +625,10 @@ async fn main() -> Result<()> {
                 }
             } else {
                 println!("❌ Failed to find site on network");
-                println!("  Try providing a peer address: grab pin {} --peer /ip4/x.x.x.x/tcp/4001", site_id);
+                println!(
+                    "  Try providing a peer address: grab pin {} --peer /ip4/x.x.x.x/tcp/4001",
+                    site_id
+                );
             }
         }
 
@@ -594,14 +676,53 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Gateway { port, default_site } => {
-            println!("🌐 Starting HTTP gateway on port {}...", port);
-            
+        Commands::Gateway {
+            port,
+            default_site,
+            tls_cert,
+            tls_key,
+            https_port,
+            aliases: alias_specs,
+            dns_aliases,
+        } => {
+            let tls = match (tls_cert, tls_key) {
+                (Some(cert), Some(key)) => {
+                    if !cert.exists() {
+                        println!("❌ TLS cert not found: {}", cert.display());
+                        return Ok(());
+                    }
+                    if !key.exists() {
+                        println!("❌ TLS key not found: {}", key.display());
+                        return Ok(());
+                    }
+                    Some(grabnet::TlsConfig {
+                        cert_path: cert,
+                        key_path: key,
+                        https_port,
+                    })
+                }
+                _ => None,
+            };
+
+            let scheme = if tls.is_some() { "https" } else { "http" };
+            let listen_port = tls
+                .as_ref()
+                .and_then(|t| t.https_port)
+                .unwrap_or(port);
+            println!("🌐 Starting {} gateway on port {}...", scheme.to_uppercase(), listen_port);
+            if tls.as_ref().and_then(|t| t.https_port).is_some() {
+                println!("   HTTP redirect on port {} -> {}://*:{}", port, scheme, listen_port);
+            }
+
             // Resolve default site if provided
             let default_site_id = if let Some(site_ref) = default_site {
                 // Try to find by name first
                 if let Some(published) = grab.bundle_store().get_published_site(&site_ref)? {
-                    println!("  Default site: {} ({})", published.name, published.site_id.to_base58());
+                    println!(
+                        "  Default site: {} ({})",
+                        published.name,
+                        published.site_id.to_base58()
+                    );
                     Some(published.site_id)
                 } else if let Some(id) = grabnet::SiteId::from_base58(&site_ref) {
                     println!("  Default site: {}", site_ref);
@@ -614,43 +735,132 @@ async fn main() -> Result<()> {
                 None
             };
 
-            if let Some(site_id) = default_site_id {
-                grab.start_gateway_with_default_site(port, site_id).await?;
-            } else {
-                grab.start_gateway_on_port(port).await?;
+            // Parse `--alias host=site` entries. The site portion may be a
+            // local site name (resolved against the bundle store) or a base58
+            // site id.
+            let mut aliases: Vec<(String, grabnet::SiteId)> = Vec::new();
+            for spec in alias_specs {
+                let Some((host, site_ref)) = spec.split_once('=') else {
+                    println!("❌ Invalid --alias spec (want host=site): {}", spec);
+                    return Ok(());
+                };
+                let host = host.trim().to_ascii_lowercase();
+                let site_ref = site_ref.trim();
+                let site_id = if let Some(published) =
+                    grab.bundle_store().get_published_site(site_ref)?
+                {
+                    published.site_id
+                } else if let Some(id) = grabnet::SiteId::from_base58(site_ref) {
+                    id
+                } else {
+                    println!("❌ Alias site not found: {}", site_ref);
+                    return Ok(());
+                };
+                println!("  Host alias: {} -> {}", host, site_id.to_base58());
+                aliases.push((host, site_id));
             }
+
+            if dns_aliases {
+                println!("  DNS resolution: enabled (TXT _grab.<host>)");
+            }
+
+            grab.start_gateway_with(grabnet::GatewayOptions {
+                port,
+                default_site: default_site_id,
+                tls,
+                aliases,
+                dns_aliases,
+            })
+            .await?;
 
             let stats = grab.storage_stats();
             println!();
-            println!("✓ Gateway running at http://127.0.0.1:{}", port);
+            println!("✓ Gateway running at {}://127.0.0.1:{}", scheme, listen_port);
             println!("  {} published sites", stats.published_sites);
             println!("  {} hosted sites", stats.hosted_sites);
             println!();
-            println!("Access sites at: http://127.0.0.1:{}/site/<site-id>/", port);
+            println!(
+                "Access sites at: {}://127.0.0.1:{}/site/<site-id>/",
+                scheme, listen_port
+            );
             println!();
             println!("Press Ctrl+C to stop");
-            
+
             tokio::signal::ctrl_c().await?;
             grab.stop_gateway().await?;
         }
 
+        Commands::Dns { action } => match action {
+            DnsAction::Resolve { host } => {
+                let resolver = grabnet::DnsResolver::from_system();
+                match resolver.resolve(&host).await {
+                    Ok(Some(id)) => {
+                        println!("✓ {} -> grab://{}", host, id.to_base58());
+                    }
+                    Ok(None) => {
+                        println!(
+                            "❌ No grab-site TXT record at _grab.{} (queried successfully)",
+                            host
+                        );
+                    }
+                    Err(e) => {
+                        println!("❌ Resolve failed: {}", e);
+                    }
+                }
+            }
+            DnsAction::Record { site } => {
+                let id = if let Some(published) = grab.bundle_store().get_published_site(&site)? {
+                    published.site_id
+                } else if let Some(id) = grabnet::SiteId::from_base58(&site) {
+                    id
+                } else {
+                    println!("❌ Site not found: {}", site);
+                    return Ok(());
+                };
+                println!("Publish this DNS record:");
+                println!();
+                println!("  _grab.<your-domain>.  IN  TXT  \"grab-site={}\"", id.to_base58());
+                println!();
+                println!("Then run the gateway with --dns-aliases to serve");
+                println!("requests for <your-domain> from this site.");
+            }
+        },
+
+        Commands::Ens { action } => match action {
+            EnsAction::Resolve { name, gateway } => {
+                let resolver = match gateway {
+                    Some(g) => grabnet::resolver::ens::EnsResolver::new(g),
+                    None => grabnet::resolver::ens::EnsResolver::default(),
+                };
+                match resolver.resolve(&name).await {
+                    Ok(id) => println!("✓ {} -> grab://{}", name, id.to_base58()),
+                    Err(e) => println!("❌ ENS resolve failed: {}", e),
+                }
+            }
+        },
+
         Commands::Bootstrap { action } => {
             let mut config = grabnet::network::BootstrapConfig::load_or_default(&data_dir)?;
-            
+
             match action {
                 BootstrapAction::List => {
                     println!("🌐 Bootstrap Nodes:");
                     println!();
-                    
+
                     println!("Official:");
                     for node in &config.official {
                         let status = if node.enabled { "✓" } else { "✗" };
-                        println!("  {} {} [{}]", status, node.name, node.region.as_deref().unwrap_or("unknown"));
+                        println!(
+                            "  {} {} [{}]",
+                            status,
+                            node.name,
+                            node.region.as_deref().unwrap_or("unknown")
+                        );
                         for addr in &node.addresses {
                             println!("      {}", addr);
                         }
                     }
-                    
+
                     if !config.community.is_empty() {
                         println!();
                         println!("Community:");
@@ -662,7 +872,7 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    
+
                     if !config.custom.is_empty() {
                         println!();
                         println!("Custom:");
@@ -674,19 +884,26 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    
+
                     println!();
-                    println!("mDNS: {}", if config.mdns_enabled { "enabled" } else { "disabled" });
+                    println!(
+                        "mDNS: {}",
+                        if config.mdns_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
                     println!("Minimum peers: {}", config.min_peers);
                 }
-                
+
                 BootstrapAction::Add { name, address } => {
                     config.add_custom(name.clone(), vec![address.clone()]);
                     config.save(&data_dir)?;
                     println!("✓ Added bootstrap node: {}", name);
                     println!("  Address: {}", address);
                 }
-                
+
                 BootstrapAction::Remove { name } => {
                     if config.remove_custom(&name) {
                         config.save(&data_dir)?;
@@ -696,11 +913,11 @@ async fn main() -> Result<()> {
                         println!("   Note: Only custom nodes can be removed");
                     }
                 }
-                
+
                 BootstrapAction::Test => {
                     println!("🔍 Testing bootstrap node connectivity...");
                     println!();
-                    
+
                     let addresses = config.get_enabled_addresses();
                     for addr in addresses {
                         print!("  {} ... ", addr);
@@ -731,18 +948,17 @@ async fn main() -> Result<()> {
 /// Run watch mode - monitor directory for changes and auto-republish
 async fn run_watch_mode(grab: &Grab, path: &str, options: PublishOptions) -> Result<()> {
     use std::sync::mpsc::channel;
-    
+
     let (tx, rx) = channel();
-    
+
     // Create debounced watcher (500ms debounce)
     let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
-    
+
     // Watch the directory recursively
-    debouncer.watcher().watch(
-        std::path::Path::new(path),
-        RecursiveMode::Recursive,
-    )?;
-    
+    debouncer
+        .watcher()
+        .watch(std::path::Path::new(path), RecursiveMode::Recursive)?;
+
     // Get the site name for updates
     let site_name = options.name.clone().unwrap_or_else(|| {
         std::path::Path::new(path)
@@ -750,43 +966,48 @@ async fn run_watch_mode(grab: &Grab, path: &str, options: PublishOptions) -> Res
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "site".to_string())
     });
-    
+
     loop {
         match rx.recv() {
             Ok(Ok(events)) => {
                 // Filter out hidden files and build artifacts
-                let relevant_events: Vec<_> = events.iter()
+                let relevant_events: Vec<_> = events
+                    .iter()
                     .filter(|e| {
                         let path_str = e.path.to_string_lossy();
-                        !path_str.contains("/.") &&
-                        !path_str.contains("/node_modules/") &&
-                        !path_str.contains("/target/") &&
-                        !path_str.contains("/.git/")
+                        !path_str.contains("/.")
+                            && !path_str.contains("/node_modules/")
+                            && !path_str.contains("/target/")
+                            && !path_str.contains("/.git/")
                     })
                     .collect();
-                
+
                 if relevant_events.is_empty() {
                     continue;
                 }
-                
+
                 // Show which files changed
                 for event in &relevant_events {
                     println!("  📝 Changed: {}", event.path.display());
                 }
-                
+
                 // Republish
                 println!("🔄 Republishing...");
                 match grab.update(&site_name).await {
                     Ok(Some(result)) => {
-                        println!("✓ Updated to revision {} ({} files)", 
-                            result.bundle.revision, result.file_count);
+                        println!(
+                            "✓ Updated to revision {} ({} files)",
+                            result.bundle.revision, result.file_count
+                        );
                     }
                     Ok(None) => {
                         // Site not found, do full publish
                         match grab.publish(path, options.clone()).await {
                             Ok(result) => {
-                                println!("✓ Published revision {} ({} files)", 
-                                    result.bundle.revision, result.file_count);
+                                println!(
+                                    "✓ Published revision {} ({} files)",
+                                    result.bundle.revision, result.file_count
+                                );
                             }
                             Err(e) => {
                                 println!("❌ Publish failed: {}", e);
@@ -808,27 +1029,27 @@ async fn run_watch_mode(grab: &Grab, path: &str, options: PublishOptions) -> Res
             }
         }
     }
-    
+
     Ok(())
 }
 
 /// Run a deploy hook command
 fn run_hook(command: &str, working_dir: &str) -> Result<()> {
     use std::process::Command;
-    
+
     let output = Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(working_dir)
         .output()?;
-    
+
     if !output.stdout.is_empty() {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     }
     if !output.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
-    
+
     if output.status.success() {
         println!("✓ Hook completed successfully");
         Ok(())

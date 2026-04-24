@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "GrabNet Resolver",
+  "version": "0.1.0",
+  "description": "Resolve grab:// URIs and grab-site DNS/ENS hosts through a local or hosted GrabNet gateway.",
+  "permissions": ["storage", "declarativeNetRequest", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "action": {
+    "default_title": "GrabNet Resolver",
+    "default_popup": "popup.html"
+  },
+  "omnibox": {
+    "keyword": "grab"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

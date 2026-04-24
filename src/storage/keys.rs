@@ -1,10 +1,10 @@
 //! Ed25519 key management
 
+use anyhow::{anyhow, Result};
 use std::path::Path;
-use anyhow::{Result, anyhow};
 
+use crate::crypto::{encode_base58, generate_keypair, SiteIdExt};
 use crate::types::PublicKey;
-use crate::crypto::{generate_keypair, encode_base58, SiteIdExt};
 
 /// Key store for Ed25519 keypairs
 pub struct KeyStore {
@@ -20,7 +20,7 @@ impl KeyStore {
     pub fn new(data_dir: &Path) -> Result<Self> {
         let db_path = data_dir.join("keys.db");
         let db = sled::open(&db_path)?;
-        
+
         Ok(Self {
             private_keys: db.open_tree("private")?,
             public_keys: db.open_tree("public")?,
@@ -32,24 +32,26 @@ impl KeyStore {
     pub fn get_or_create(&self, name: &str) -> Result<(PublicKey, [u8; 32])> {
         // Check if exists
         if let Some(private_key) = self.private_keys.get(name.as_bytes())? {
-            let public_key = self.public_keys.get(name.as_bytes())?
+            let public_key = self
+                .public_keys
+                .get(name.as_bytes())?
                 .ok_or_else(|| anyhow!("Corrupted key store: missing public key"))?;
-            
+
             let mut priv_arr = [0u8; 32];
             let mut pub_arr = [0u8; 32];
             priv_arr.copy_from_slice(&private_key);
             pub_arr.copy_from_slice(&public_key);
-            
+
             return Ok((pub_arr, priv_arr));
         }
-        
+
         // Generate new keypair
         let (public_key, private_key) = generate_keypair();
-        
+
         // Store
         self.private_keys.insert(name.as_bytes(), &private_key)?;
         self.public_keys.insert(name.as_bytes(), &public_key)?;
-        
+
         Ok((public_key, private_key))
     }
 
@@ -92,11 +94,11 @@ impl KeyStore {
         // Derive public key
         let signing_key = ed25519_dalek::SigningKey::from_bytes(private_key);
         let public_key = signing_key.verifying_key().to_bytes();
-        
+
         // Store
         self.private_keys.insert(name.as_bytes(), private_key)?;
         self.public_keys.insert(name.as_bytes(), &public_key)?;
-        
+
         Ok(public_key)
     }
 
@@ -131,19 +133,19 @@ mod tests {
     fn test_key_creation() -> Result<()> {
         let dir = tempdir()?;
         let store = KeyStore::new(dir.path())?;
-        
+
         // Get or create
         let (pub1, priv1) = store.get_or_create("default")?;
-        
+
         // Should return same key
         let (pub2, priv2) = store.get_or_create("default")?;
         assert_eq!(pub1, pub2);
         assert_eq!(priv1, priv2);
-        
+
         // Different name = different key
         let (pub3, _) = store.get_or_create("other")?;
         assert_ne!(pub1, pub3);
-        
+
         Ok(())
     }
 
@@ -151,26 +153,26 @@ mod tests {
     fn test_key_import_export() -> Result<()> {
         let dir = tempdir()?;
         let store = KeyStore::new(dir.path())?;
-        
+
         // Create a key
         let (_, original_private) = store.get_or_create("test")?;
-        
+
         // Export
         let exported = store.export("test")?.unwrap();
-        
+
         // Import to different name
         let dir2 = tempdir()?;
         let store2 = KeyStore::new(dir2.path())?;
-        
+
         let mut private_bytes = [0u8; 32];
         private_bytes.copy_from_slice(&bs58::decode(&exported).into_vec()?);
-        
+
         store2.import("imported", &private_bytes)?;
-        
+
         // Verify
         let retrieved = store2.get_private_key("imported")?.unwrap();
         assert_eq!(retrieved, original_private);
-        
+
         Ok(())
     }
 
@@ -178,17 +180,17 @@ mod tests {
     fn test_list_keys() -> Result<()> {
         let dir = tempdir()?;
         let store = KeyStore::new(dir.path())?;
-        
+
         store.get_or_create("key1")?;
         store.get_or_create("key2")?;
         store.get_or_create("key3")?;
-        
+
         let keys = store.list_keys()?;
         assert_eq!(keys.len(), 3);
         assert!(keys.contains(&"key1".to_string()));
         assert!(keys.contains(&"key2".to_string()));
         assert!(keys.contains(&"key3".to_string()));
-        
+
         Ok(())
     }
 }

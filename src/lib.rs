@@ -14,7 +14,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use grabnet::{Grab, PublishOptions};
+//! use grabnet::{Grab, PublishOptions, encode_base58};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -23,7 +23,7 @@
 //!
 //!     // Publish a website
 //!     let result = grab.publish("./my-website", PublishOptions::default()).await?;
-//!     println!("Published to: grab://{}", result.site_id);
+//!     println!("Published to: grab://{}", encode_base58(&result.bundle.site_id));
 //!
 //!     // Start the HTTP gateway
 //!     grab.start_gateway().await?;
@@ -32,27 +32,31 @@
 //! }
 //! ```
 
-pub mod types;
-pub mod crypto;
-pub mod storage;
-pub mod network;
-pub mod gateway;
 pub mod content;
+pub mod crypto;
+pub mod erasure;
+pub mod gateway;
+pub mod network;
 pub mod publisher;
+pub mod resolver;
+pub mod storage;
+pub mod types;
 
 // Re-export main types
-pub use types::*;
-pub use crypto::{hash, sign, verify, generate_keypair, SiteIdExt, encode_base58, decode_base58};
-pub use storage::{ChunkStore, BundleStore, KeyStore};
-pub use network::{GrabNetwork, NetworkEvent};
-pub use gateway::Gateway;
 pub use content::UserContentManager;
-pub use publisher::{Publisher, PublishOptions, PublishResult};
+pub use crypto::{decode_base58, encode_base58, generate_keypair, hash, sign, verify, SiteIdExt};
+pub use erasure::{ErasureCodec, ErasureConfig, Shard, ShardId, ShardStore};
+pub use gateway::Gateway;
+pub use network::{GrabNetwork, NetworkEvent};
+pub use publisher::{PublishOptions, PublishResult, Publisher};
+pub use resolver::{DnsResolver, HostAliases};
+pub use storage::{BundleStore, ChunkStore, KeyStore};
+pub use types::*;
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::RwLock;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Main GrabNet SDK
 pub struct Grab {
@@ -61,6 +65,7 @@ pub struct Grab {
     chunk_store: Arc<ChunkStore>,
     bundle_store: Arc<BundleStore>,
     key_store: Arc<KeyStore>,
+    shard_store: Arc<ShardStore>,
     publisher: Publisher,
     network: Arc<RwLock<Option<GrabNetwork>>>,
     gateway: Arc<RwLock<Option<Gateway>>>,
@@ -82,12 +87,10 @@ impl Grab {
         let chunk_store = Arc::new(ChunkStore::new(&data_dir)?);
         let bundle_store = Arc::new(BundleStore::new(&data_dir)?);
         let key_store = Arc::new(KeyStore::new(&data_dir)?);
+        let shard_store = Arc::new(ShardStore::new(&data_dir)?);
 
-        let publisher = Publisher::new(
-            chunk_store.clone(),
-            bundle_store.clone(),
-            key_store.clone(),
-        );
+        let publisher =
+            Publisher::new(chunk_store.clone(), bundle_store.clone(), key_store.clone());
 
         Ok(Self {
             config,
@@ -95,6 +98,7 @@ impl Grab {
             chunk_store,
             bundle_store,
             key_store,
+            shard_store,
             publisher,
             network: Arc::new(RwLock::new(None)),
             gateway: Arc::new(RwLock::new(None)),
@@ -120,7 +124,9 @@ impl Grab {
 
         // Announce to network if running
         if let Some(network) = self.network.read().as_ref() {
-            network.announce_site(&result.bundle.site_id, result.bundle.revision).await?;
+            network
+                .announce_site(&result.bundle.site_id, result.bundle.revision)
+                .await?;
         }
 
         Ok(result)
@@ -133,13 +139,16 @@ impl Grab {
             None => return Ok(None),
         };
 
-        let result = self.publisher.publish(
-            site.root_path.to_str().unwrap_or(""),
-            PublishOptions {
-                name: Some(site.name.clone()),
-                ..Default::default()
-            },
-        ).await?;
+        let result = self
+            .publisher
+            .publish(
+                site.root_path.to_str().unwrap_or(""),
+                PublishOptions {
+                    name: Some(site.name.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         // Push update to network
         if let Some(network) = self.network.read().as_ref() {
@@ -206,7 +215,9 @@ impl Grab {
             self.chunk_store.clone(),
             self.bundle_store.clone(),
             self.key_store.clone(),
-        ).await?;
+            self.shard_store.clone(),
+        )
+        .await?;
 
         network.start().await?;
 
@@ -257,38 +268,74 @@ impl Grab {
 
     /// Start the HTTP gateway on a specific port
     pub async fn start_gateway_on_port(&self, port: u16) -> Result<()> {
-        self.start_gateway_with_options(port, None).await
+        self.start_gateway_with(GatewayOptions {
+            port,
+            ..Default::default()
+        })
+        .await
     }
 
     /// Start the HTTP gateway with a default site served at root
-    pub async fn start_gateway_with_default_site(&self, port: u16, default_site: SiteId) -> Result<()> {
-        self.start_gateway_with_options(port, Some(default_site)).await
+    pub async fn start_gateway_with_default_site(
+        &self,
+        port: u16,
+        default_site: SiteId,
+    ) -> Result<()> {
+        self.start_gateway_with(GatewayOptions {
+            port,
+            default_site: Some(default_site),
+            ..Default::default()
+        })
+        .await
     }
 
-    /// Start the HTTP gateway with options
-    async fn start_gateway_with_options(&self, port: u16, default_site: Option<SiteId>) -> Result<()> {
+    /// Start the HTTP gateway with full options (port, default site, TLS,
+    /// host aliases, DNS resolution).
+    pub async fn start_gateway_with(&self, opts: GatewayOptions) -> Result<()> {
         if self.gateway.read().is_some() {
             return Ok(());
         }
 
         let mut config = self.config.clone();
-        config.gateway.port = port;
+        config.gateway.port = opts.port;
+        if opts.tls.is_some() {
+            config.gateway.tls = opts.tls;
+        }
 
-        let gateway = if let Some(site_id) = default_site {
+        let aliases = resolver::HostAliases::new();
+        for (host, site_id) in &opts.aliases {
+            aliases.insert(host, *site_id);
+        }
+
+        let dns_resolver = if opts.dns_aliases {
+            Some(resolver::DnsResolver::from_system())
+        } else {
+            None
+        };
+
+        let gateway = if let Some(site_id) = opts.default_site {
             Gateway::with_default_site(
                 &config,
                 self.chunk_store.clone(),
                 self.bundle_store.clone(),
                 self.content_manager.read().clone(),
                 site_id,
-            ).with_network(self.network.clone())
+            )
         } else {
             Gateway::new(
                 &config,
                 self.chunk_store.clone(),
                 self.bundle_store.clone(),
                 self.content_manager.read().clone(),
-            ).with_network(self.network.clone())
+            )
+        }
+        .with_network(self.network.clone())
+        .with_aliases(aliases);
+
+        let gateway = if let Some(r) = dns_resolver {
+            gateway.with_dns_resolver(r)
+        } else {
+            gateway
         };
 
         gateway.start().await?;
@@ -367,8 +414,16 @@ impl Grab {
         StorageStats {
             chunks: self.chunk_store.count(),
             total_size: self.chunk_store.total_size(),
-            published_sites: self.bundle_store.get_all_published_sites().unwrap_or_default().len(),
-            hosted_sites: self.bundle_store.get_all_hosted_sites().unwrap_or_default().len(),
+            published_sites: self
+                .bundle_store
+                .get_all_published_sites()
+                .unwrap_or_default()
+                .len(),
+            hosted_sites: self
+                .bundle_store
+                .get_all_hosted_sites()
+                .unwrap_or_default()
+                .len(),
         }
     }
 
@@ -385,6 +440,11 @@ impl Grab {
     /// Get bundle store reference
     pub fn bundle_store(&self) -> &Arc<BundleStore> {
         &self.bundle_store
+    }
+
+    /// Get shard store reference
+    pub fn shard_store(&self) -> &Arc<ShardStore> {
+        &self.shard_store
     }
 
     /// Get network reference (if running)
@@ -407,7 +467,9 @@ impl Grab {
     }
 
     /// Subscribe to network events
-    pub fn subscribe_network(&self) -> Option<tokio::sync::broadcast::Receiver<network::NetworkEvent>> {
+    pub fn subscribe_network(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<network::NetworkEvent>> {
         self.network.read().as_ref().map(|n| n.subscribe())
     }
 }

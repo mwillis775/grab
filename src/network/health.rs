@@ -2,10 +2,10 @@
 //!
 //! Tracks connection health, peer reliability, and network metrics.
 
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
-use parking_lot::RwLock;
 
 /// Peer score tracking for reputation-based prioritization
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,16 +50,17 @@ impl PeerScore {
         self.total_requests += 1;
         self.successful_responses += 1;
         self.bytes_received += bytes;
-        
+
         // Update rolling average response time
-        self.avg_response_time_ms = (self.avg_response_time_ms * (self.total_requests - 1) 
-            + response_time_ms) / self.total_requests;
-        
+        self.avg_response_time_ms = (self.avg_response_time_ms * (self.total_requests - 1)
+            + response_time_ms)
+            / self.total_requests;
+
         self.last_seen = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        
+
         self.recalculate_score();
     }
 
@@ -93,7 +94,9 @@ impl PeerScore {
         };
 
         // Longevity contributes 10%
-        let longevity_score = if self.total_requests > 100 { 10 } else {
+        let longevity_score = if self.total_requests > 100 {
+            10
+        } else {
             (self.total_requests / 10) as u8
         };
 
@@ -180,9 +183,10 @@ impl HealthMonitor {
     pub fn peer_connected(&self, peer_id: &str) {
         // Update or create peer score
         let mut scores = self.scores.write();
-        scores.entry(peer_id.to_string())
+        scores
+            .entry(peer_id.to_string())
             .or_insert_with(|| PeerScore::new(peer_id.to_string()));
-        
+
         // Update metrics
         let mut metrics = self.metrics.write();
         metrics.connected_peers += 1;
@@ -201,21 +205,23 @@ impl HealthMonitor {
     pub fn record_request_success(&self, peer_id: &str, response_time_ms: u64, bytes: u64) {
         {
             let mut scores = self.scores.write();
-            let score = scores.entry(peer_id.to_string())
+            let score = scores
+                .entry(peer_id.to_string())
                 .or_insert_with(|| PeerScore::new(peer_id.to_string()));
             score.record_success(response_time_ms, bytes);
         }
-        
+
         {
             let mut metrics = self.metrics.write();
             metrics.total_requests += 1;
             metrics.successful_requests += 1;
             metrics.total_bytes_transferred += bytes;
-            
+
             // Update rolling average latency
             if metrics.total_requests > 0 {
-                metrics.avg_latency_ms = (metrics.avg_latency_ms * (metrics.total_requests - 1) 
-                    + response_time_ms) / metrics.total_requests;
+                metrics.avg_latency_ms = (metrics.avg_latency_ms * (metrics.total_requests - 1)
+                    + response_time_ms)
+                    / metrics.total_requests;
             }
         }
     }
@@ -224,11 +230,12 @@ impl HealthMonitor {
     pub fn record_request_failure(&self, peer_id: &str) {
         {
             let mut scores = self.scores.write();
-            let score = scores.entry(peer_id.to_string())
+            let score = scores
+                .entry(peer_id.to_string())
                 .or_insert_with(|| PeerScore::new(peer_id.to_string()));
             score.record_failure();
         }
-        
+
         {
             let mut metrics = self.metrics.write();
             metrics.total_requests += 1;
@@ -237,7 +244,9 @@ impl HealthMonitor {
 
     /// Update connection health for a peer
     pub fn update_health(&self, health: ConnectionHealth) {
-        self.health_cache.write().insert(health.peer_id.clone(), health);
+        self.health_cache
+            .write()
+            .insert(health.peer_id.clone(), health);
     }
 
     /// Get peer score
@@ -283,7 +292,7 @@ impl HealthMonitor {
     pub fn get_health_summary(&self) -> HealthSummary {
         let metrics = self.get_metrics();
         let scores = self.get_all_scores();
-        
+
         let avg_score = if scores.is_empty() {
             0.0
         } else {
@@ -297,7 +306,14 @@ impl HealthMonitor {
         };
 
         HealthSummary {
-            status: if reliability > 95.0 { "healthy" } else if reliability > 80.0 { "good" } else { "degraded" }.to_string(),
+            status: if reliability > 95.0 {
+                "healthy"
+            } else if reliability > 80.0 {
+                "good"
+            } else {
+                "degraded"
+            }
+            .to_string(),
             connected_peers: metrics.connected_peers,
             avg_peer_score: avg_score,
             network_reliability: reliability,
@@ -333,22 +349,22 @@ mod tests {
     #[test]
     fn test_peer_score() {
         let mut score = PeerScore::new("test-peer".to_string());
-        
+
         // Initial score
         assert_eq!(score.score, 50);
-        
+
         // Record successes
         score.record_success(50, 1000);
         score.record_success(60, 2000);
         score.record_success(70, 1500);
-        
+
         // Score should improve
         assert!(score.score > 50);
         assert_eq!(score.successful_responses, 3);
-        
+
         // Record failure
         score.record_failure();
-        
+
         // Score should drop slightly
         assert!(score.score < 100);
         assert_eq!(score.failed_requests, 1);
@@ -357,28 +373,28 @@ mod tests {
     #[test]
     fn test_health_monitor() {
         let monitor = HealthMonitor::new();
-        
+
         // Connect peers
         monitor.peer_connected("peer1");
         monitor.peer_connected("peer2");
-        
+
         let metrics = monitor.get_metrics();
         assert_eq!(metrics.connected_peers, 2);
         assert_eq!(metrics.total_peers_seen, 2);
-        
+
         // Record requests
         monitor.record_request_success("peer1", 100, 1000);
         monitor.record_request_success("peer1", 50, 500);
         monitor.record_request_failure("peer2");
-        
+
         let metrics = monitor.get_metrics();
         assert_eq!(metrics.total_requests, 3);
         assert_eq!(metrics.successful_requests, 2);
-        
+
         // Check peer scores
         let score1 = monitor.get_peer_score("peer1").unwrap();
         assert!(score1.score > 50);
-        
+
         let score2 = monitor.get_peer_score("peer2").unwrap();
         assert!(score2.score < 50);
     }
@@ -386,15 +402,15 @@ mod tests {
     #[test]
     fn test_top_peers() {
         let monitor = HealthMonitor::new();
-        
+
         monitor.peer_connected("good-peer");
         monitor.record_request_success("good-peer", 50, 1000);
         monitor.record_request_success("good-peer", 60, 1000);
-        
+
         monitor.peer_connected("bad-peer");
         monitor.record_request_failure("bad-peer");
         monitor.record_request_failure("bad-peer");
-        
+
         let top = monitor.get_top_peers(5);
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].peer_id, "good-peer");
